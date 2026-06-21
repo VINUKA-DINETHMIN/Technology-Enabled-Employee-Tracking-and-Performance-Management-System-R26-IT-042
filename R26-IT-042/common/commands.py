@@ -56,6 +56,7 @@ class CommandPoller:
 
     def _poll(self) -> None:
         if not self._db or not self._db.is_connected:
+            logger.debug("CommandPoller: DB not connected; skipping poll")
             return
 
         col = self._db.get_collection("commands")
@@ -71,7 +72,11 @@ class CommandPoller:
             "expires_at": {"$gt": now}
         }
         
-        commands = list(col.find(query))
+        try:
+            commands = list(col.find(query))
+        except Exception as exc:
+            logger.error("CommandPoller: failed querying commands: %s", exc)
+            return
         for cmd in commands:
             cmd_id = cmd.get("command_id")
             cmd_type = cmd.get("command_type")
