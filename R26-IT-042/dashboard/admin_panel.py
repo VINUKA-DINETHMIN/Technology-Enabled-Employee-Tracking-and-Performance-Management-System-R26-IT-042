@@ -585,25 +585,41 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
         self._ss_poll_after_id = self.after(10000, self._poll_screenshots)  # Poll every 10 seconds instead of 3
 
     def _force_screenshot(self, emp_id: str) -> None:
-        if not self._db or not self._db.is_connected: return
         import uuid
+        if not self._db or not self._db.is_connected:
+            messagebox.showerror("Error", "Database connection unavailable. Cannot send command.")
+            return
         try:
             col = self._db.get_collection("commands")
-            if col is not None:
-                now = datetime.utcnow()
-                expires = (now + timedelta(minutes=5)).isoformat()
-                col.insert_one({
-                    "command_id": str(uuid.uuid4()),
-                    "target_user_id": emp_id,
-                    "command_type": "force_screenshot",
-                    "status": "pending",
-                    "timestamp": now.isoformat(),
-                    "expires_at": expires
-                })
+            if col is None:
+                messagebox.showerror("Error", "Commands collection unavailable.")
+                return
+
+            now = datetime.utcnow()
+            # Extend expiry slightly to reduce chance of accidental expiry
+            expires = (now + timedelta(minutes=10)).isoformat()
+            doc = {
+                "command_id": str(uuid.uuid4()),
+                "target_user_id": emp_id,
+                "command_type": "force_screenshot",
+                "status": "pending",
+                "timestamp": now.isoformat(),
+                "expires_at": expires
+            }
+            col.insert_one(doc)
 
             # Trigger quick UI refresh attempts so new screenshot appears as soon as written.
             self._schedule_screenshot_refresh(initial_delay_ms=800)
-        except Exception: pass
+            messagebox.showinfo("Command Sent", "Force screenshot command sent to employee.")
+
+            # Start a short async wait to check whether the command was accepted
+            try:
+                self._wait_for_command_ack(doc["command_id"], timeout_sec=20)
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Failed to send force_screenshot command: %s", exc)
+            messagebox.showerror("Error", f"Failed to send command: {exc}")
 
     def _resend_mfa(self) -> None:
         from common.email_utils import send_mfa_setup_email
@@ -844,6 +860,66 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
         except Exception as exc:
             logger.debug("Anti-spoofing UI render error: %s", exc)
 
+    def _wait_for_command_ack(self, command_id: str, timeout_sec: int = 20) -> None:
+        """Poll the `commands` collection for the given command_id until status changes or timeout.
+
+        Runs asynchronously on the Tk event loop using `after` to avoid blocking.
+        """
+        start = time.time()
+
+        def _check():
+            try:
+                if not self._db or not self._db.is_connected:
+                    # Try again a few times; DB may be transiently unavailable
+                    if time.time() - start < timeout_sec:
+                        self.after(1000, _check)
+                    else:
+                        messagebox.showwarning("Command Status", "Could not confirm command acceptance (DB offline).")
+                    return
+
+                col = self._db.get_collection("commands")
+                if col is None:
+                    if time.time() - start < timeout_sec:
+                        self.after(1000, _check)
+                    else:
+                        messagebox.showwarning("Command Status", "Commands collection unavailable.")
+                    return
+
+                doc = col.find_one({"command_id": command_id})
+                if not doc:
+                    if time.time() - start < timeout_sec:
+                        self.after(1000, _check)
+                    else:
+                        messagebox.showwarning("Command Status", "Command not found in database.")
+                    return
+
+                status = doc.get("status", "pending")
+                if status == "pending":
+                    if time.time() - start < timeout_sec:
+                        self.after(1000, _check)
+                    else:
+                        messagebox.showinfo("Command Status", "Command still pending (no response from employee).")
+                    return
+
+                # Show final status
+                if status == "processing":
+                    messagebox.showinfo("Command Accepted", "Employee has accepted the command and is processing it.")
+                elif status == "completed":
+                    messagebox.showinfo("Command Completed", "Employee has completed the command.")
+                elif status == "failed":
+                    messagebox.showerror("Command Failed", f"Employee reported failure: {doc.get('error')}")
+                else:
+                    messagebox.showinfo("Command Status", f"Command status: {status}")
+            except Exception as exc:
+                logger.debug("_wait_for_command_ack check error: %s", exc)
+                if time.time() - start < timeout_sec:
+                    self.after(1000, _check)
+                else:
+                    messagebox.showwarning("Command Status", "Unable to determine command status.")
+
+        # Kick off the first check
+        self.after(1000, _check)
+
     def _trigger_antispoofing_check(self, emp_id: str) -> None:
         """Send antispoofing check command to employee device."""
         try:
@@ -858,9 +934,14 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
                 "command_type": "start_antispoofing_check",
                 "status": "pending",
                 "created_at": datetime.utcnow().isoformat(),
-                "expires_at": (datetime.utcnow() + timedelta(minutes=5)).isoformat()
+                "expires_at": (datetime.utcnow() + timedelta(minutes=10)).isoformat()
             }
-            col.insert_one(cmd)
+            try:
+                col.insert_one(cmd)
+            except Exception as exc:
+                logger.exception("Failed to send antispoofing command: %s", exc)
+                messagebox.showerror("Error", f"Failed to initiate verification: {exc}")
+                return
 
             # Show status message
             messagebox.showinfo(
@@ -869,6 +950,10 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
                 "The employee will see a camera prompt.\n"
                 "Results will appear below in 10-15 seconds."
             )
+            try:
+                self._wait_for_command_ack(cmd["command_id"], timeout_sec=25)
+            except Exception:
+                pass
 
             # Schedule refresh
             self.after(3000, lambda: self._update_antispoofing_display(
