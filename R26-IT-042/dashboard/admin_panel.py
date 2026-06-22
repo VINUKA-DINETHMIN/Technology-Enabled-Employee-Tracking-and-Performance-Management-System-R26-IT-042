@@ -1758,6 +1758,17 @@ class AdminPanel(ctk.CTk):
         header.pack_propagate(False)
         
         ctk.CTkLabel(header, text="Live Screen Monitor Grid", font=ctk.CTkFont(size=18, weight="bold")).pack(side="left", padx=20)
+
+        ctk.CTkButton(
+            header,
+            text="Clear",
+            width=88,
+            height=30,
+            fg_color="#7f1d1d",
+            hover_color="#991b1b",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._clear_live_grid_view,
+        ).pack(side="right", padx=20)
         
         self._grid_scroll = ctk.CTkScrollableFrame(frame, fg_color="transparent")
         self._grid_scroll.pack(fill="both", expand=True)
@@ -2069,6 +2080,31 @@ class AdminPanel(ctk.CTk):
 
     def _refresh_live_grid(self) -> None:
         threading.Thread(target=self._fetch_live_grid, daemon=True).start()
+
+    def _clear_live_grid_view(self) -> None:
+        """Clear the current live monitor view without changing employee-side streams."""
+        if not hasattr(self, "_grid_items"):
+            self._grid_items = {}
+        if not hasattr(self, "_image_cache"):
+            self._image_cache = {}
+
+        if not messagebox.askyesno(
+            "Clear Live Grid",
+            "Clear the current live monitor tiles from this view?\n\n"
+            "This only clears the admin display. Active employee streams will appear again on the next refresh.",
+        ):
+            return
+
+        try:
+            for item in list(self._grid_items.values()):
+                try:
+                    item["frame"].destroy()
+                except Exception:
+                    pass
+            self._grid_items.clear()
+            self._image_cache.clear()
+        except Exception as exc:
+            messagebox.showerror("Clear Live Grid", f"Could not clear live grid: {exc}")
 
     def _fetch_live_grid(self) -> None:
         if not self._db or not self._db.is_connected: return
