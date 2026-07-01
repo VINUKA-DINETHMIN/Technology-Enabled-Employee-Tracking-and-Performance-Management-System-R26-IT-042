@@ -450,51 +450,54 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
                 top_app = str(item.get("top_app") or "-")
                 idle_ratio = float(item.get("idle_ratio", 0.0) or 0.0)
 
+                # Consistent column widths for alignment
                 ctk.CTkLabel(
                     row,
                     text=_fmt_time(item.get("timestamp", "")),
                     text_color=C_MUTED,
                     font=ctk.CTkFont(size=11),
-                    width=65,
-                ).pack(side="left", padx=(8, 4), pady=6)
+                    width=50,
+                ).pack(side="left", padx=6, pady=6)
                 ctk.CTkLabel(
                     row,
                     text=f"Risk {risk:.1f}",
                     text_color=_risk_color(risk),
                     font=ctk.CTkFont(size=11, weight="bold"),
-                    width=85,
-                ).pack(side="left", padx=4)
+                    width=75,
+                ).pack(side="left", padx=6)
                 ctk.CTkLabel(
                     row,
                     text=f"Prod {prod:.0f}%",
                     text_color=C_TEXT,
                     font=ctk.CTkFont(size=11),
-                    width=80,
-                ).pack(side="left", padx=4)
+                    width=70,
+                ).pack(side="left", padx=6)
                 ctk.CTkLabel(
                     row,
                     text=f"Idle {idle_ratio:.2f}",
                     text_color=C_TEXT,
                     font=ctk.CTkFont(size=11),
-                    width=75,
-                ).pack(side="left", padx=4)
+                    width=70,
+                ).pack(side="left", padx=6)
                 ctk.CTkLabel(
                     row,
                     text=f"App {top_app}",
                     text_color=C_TEXT,
                     font=ctk.CTkFont(size=11),
+                    width=100,
                 ).pack(side="left", padx=6)
                 ctk.CTkLabel(
                     row,
                     text=lbl.replace("_", " ").title(),
                     text_color=C_AMBER if "risk" in lbl else C_GREEN,
                     font=ctk.CTkFont(size=11),
-                ).pack(side="right", padx=(4, 8))
+                    width=110,
+                ).pack(side="right", padx=6)
 
                 ctk.CTkButton(
                     row,
                     text="View",
-                    width=52,
+                    width=50,
                     height=24,
                     fg_color=C_SIDEBAR,
                     hover_color=C_BLUE,
@@ -505,13 +508,13 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
                 ctk.CTkButton(
                     row,
                     text="Delete",
-                    width=58,
+                    width=56,
                     height=24,
                     fg_color="#7f1d1d",
                     hover_color="#991b1b",
                     font=ctk.CTkFont(size=10, weight="bold"),
                     command=lambda d=item: self._delete_activity_log(emp_id, d),
-                ).pack(side="right", padx=4)
+                ).pack(side="right", padx=6)
 
         ctk.CTkFrame(lgf, fg_color="transparent", height=8).pack()
 

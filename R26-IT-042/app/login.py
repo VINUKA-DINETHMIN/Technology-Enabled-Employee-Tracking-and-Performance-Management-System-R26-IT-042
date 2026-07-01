@@ -179,15 +179,9 @@ class LoginWindow(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _build(self) -> None:
-        # Logo
-        try:
-            from PIL import Image
-            raw = Image.open(LOGO_PATH).convert("RGBA").resize((90, 90), Image.LANCZOS)
-            self._logo = ctk.CTkImage(light_image=raw, dark_image=raw, size=(90, 90))
-            ctk.CTkLabel(self, image=self._logo, text="").pack(pady=(30, 4))
-        except Exception:
-            ctk.CTkLabel(self, text="WorkPlus", font=ctk.CTkFont(size=32, weight="bold"),
-                         text_color=C_TEAL).pack(pady=(30, 4))
+        # Header text
+        ctk.CTkLabel(self, text="WorkPlus", font=ctk.CTkFont(size=32, weight="bold"),
+                     text_color=C_TEAL).pack(pady=(30, 4))
 
         ctk.CTkLabel(self, text=settings.APP_NAME,
                      font=ctk.CTkFont(size=18, weight="bold"), text_color=C_TEXT).pack()
