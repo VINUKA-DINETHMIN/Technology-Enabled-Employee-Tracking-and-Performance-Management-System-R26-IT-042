@@ -139,7 +139,7 @@ class EfficiencyWindow(ctk.CTk):
         for title, width in [
             ("Employee", 230),
             ("Prediction", 130),
-            ("Confidence", 120),
+            ("Efficiency Score", 130),
             ("Input Productivity", 150),
             ("Workload", 110),
             ("Assigned", 90),
@@ -266,7 +266,7 @@ class EfficiencyWindow(ctk.CTk):
             values = [
                 (f"{r.full_name} ({r.employee_id})", 230, C_TEXT),
                 (r.predicted_label, 130, pred_color),
-                (f"{r.confidence * 100:.1f}%", 120, C_TEXT),
+                (f"{r.efficiency_score:.1f}", 130, C_TEXT),
                 (f"{r.productivity_score_input:.1f}", 150, C_TEXT),
                 (f"{r.workload_score:.1f}", 110, C_TEXT),
                 (str(r.total_tasks_assigned), 90, C_TEXT),

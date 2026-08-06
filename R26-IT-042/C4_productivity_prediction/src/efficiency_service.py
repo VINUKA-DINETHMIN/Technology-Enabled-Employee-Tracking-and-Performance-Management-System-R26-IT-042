@@ -20,6 +20,7 @@ class EmployeeEfficiencyResult:
     full_name: str
     predicted_label: str
     confidence: float
+    efficiency_score: float
     productivity_score_input: float
     workload_score: float
     total_tasks_assigned: int
@@ -169,6 +170,11 @@ class EfficiencyPredictionService:
                     full_name=stats["full_name"],
                     predicted_label=str(label),
                     confidence=confidence,
+                    efficiency_score=self._calculate_efficiency_score(
+                        float(stats["workload_score"]),
+                        str(label),
+                        confidence,
+                    ),
                     productivity_score_input=float(stats["productivity_score_input"]),
                     workload_score=float(stats["workload_score"]),
                     total_tasks_assigned=int(stats["total_tasks_assigned"]),
@@ -514,6 +520,20 @@ class EfficiencyPredictionService:
         if not values:
             return None
         return sum(values) / len(values)
+
+    @staticmethod
+    def _label_score(label: str) -> float:
+        return {
+            "high": 100.0,
+            "medium": 65.0,
+            "low": 30.0,
+        }.get(str(label).strip().lower(), 0.0)
+
+    @classmethod
+    def _calculate_efficiency_score(cls, workload_score: float, predicted_label: str, confidence: float) -> float:
+        label_score = cls._label_score(predicted_label)
+        score = 0.70 * float(workload_score) + 0.30 * (label_score * float(confidence))
+        return float(round(max(0.0, min(100.0, score)), 3))
 
     def _filter_tasks_for_period(
         self,
