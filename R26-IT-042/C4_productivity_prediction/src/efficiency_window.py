@@ -309,12 +309,12 @@ class EfficiencyWindow(ctk.CTk):
                 period_start=period_start,
                 period_end=period_end,
             )
-            self.after(0, lambda: self._show_employee_details(report, employee_id))
+            self.after(0, lambda: self._show_employee_details(report, employee_id, period_start, period_end))
         except Exception as exc:
             logger.exception("Failed to build employee productivity report")
             self.after(0, lambda: messagebox.showerror("Productivity Report", f"Failed to load report: {exc}"))
 
-    def _show_employee_details(self, report, employee_id: str) -> None:
+    def _show_employee_details(self, report, employee_id: str, period_start=None, period_end=None) -> None:
         if report is None:
             self._status_var.set("No report available for selected employee.")
             messagebox.showinfo("Productivity Report", f"No report data available for {employee_id} in this period.")
@@ -360,7 +360,7 @@ class EfficiencyWindow(ctk.CTk):
         metric_cards = [
             ("Prediction", str(report.predicted_label), pred_color),
             ("Confidence", f"{report.confidence * 100:.1f}%", C_TEAL),
-            ("Prod. Score", f"{report.productivity_score:.1f}", C_BLUE),
+            ("Efficiency Score", f"{report.efficiency_score:.1f}", C_BLUE),
             ("Workload", f"{report.workload_score:.1f}", C_AMBER),
         ]
 
@@ -410,6 +410,66 @@ class EfficiencyWindow(ctk.CTk):
             ctk.CTkLabel(
                 content,
                 text=f"- {insight}",
+                text_color=C_MUTED,
+                font=ctk.CTkFont(size=12),
+                justify="left",
+                wraplength=780,
+            ).pack(anchor="w", padx=12, pady=2)
+
+        lime_lines = self._service.get_employee_lime_explanation(
+            self._db,
+            employee_id=employee_id,
+            period_start=period_start,
+            period_end=period_end,
+        )
+
+        efficiency_state = "strong" if report.efficiency_score >= 70 else "needs attention" if report.efficiency_score < 50 else "mixed"
+        workload_state = "healthy" if report.workload_score >= 70 else "strained" if report.workload_score < 50 else "moderate"
+        insight_summary = " ".join(report.insights[:3]) if report.insights else "The model did not find any strong warning or support signals beyond the score itself."
+
+        ctk.CTkLabel(
+            content,
+            text="Business interpretation",
+            text_color=C_TEXT,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
+        ctk.CTkLabel(
+            content,
+            text=(
+                f"This employee's efficiency score is {report.efficiency_score:.1f}/100, so the current picture is {efficiency_state}. "
+                f"The workload score is {report.workload_score:.1f}/100, which is {workload_state}. {insight_summary} "
+                "Taken together, this helps a manager or HR reviewer decide whether the employee is performing well, holding steady, or slipping because of unfinished work, late completion, or weaker activity patterns."
+            ),
+            text_color=C_MUTED,
+            font=ctk.CTkFont(size=12),
+            wraplength=780,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+
+        ctk.CTkLabel(
+            content,
+            text="How to read the model output",
+            text_color=C_TEXT,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+
+        ctk.CTkLabel(
+            content,
+            text=(
+                "The lines below are the main reasons the model leaned toward this result. They describe whether task completion, pending work, "
+                "and activity patterns helped the employee's score or pulled it down."
+            ),
+            text_color=C_MUTED,
+            font=ctk.CTkFont(size=12),
+            wraplength=780,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+
+        for line in lime_lines:
+            ctk.CTkLabel(
+                content,
+                text=f"- {line}",
                 text_color=C_MUTED,
                 font=ctk.CTkFont(size=12),
                 justify="left",
