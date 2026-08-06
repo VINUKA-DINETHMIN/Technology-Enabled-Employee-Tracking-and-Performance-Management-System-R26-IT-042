@@ -163,14 +163,14 @@ class LoginWindow(ctk.CTk):
         self._mfa_in_progress = False
 
         self.title(f"{settings.APP_NAME} — Login")
-        self.geometry("480x680")
+        self.geometry("480x740")
         self.resizable(False, False)
         self.configure(fg_color=C_BG)
 
         self.update_idletasks()
         x = (self.winfo_screenwidth() - 480) // 2
-        y = (self.winfo_screenheight() - 680) // 2
-        self.geometry(f"480x680+{x}+{y}")
+        y = (self.winfo_screenheight() - 740) // 2
+        self.geometry(f"480x740+{x}+{y}")
 
         self._build()
 
@@ -179,15 +179,9 @@ class LoginWindow(ctk.CTk):
     # ------------------------------------------------------------------
 
     def _build(self) -> None:
-        # Logo
-        try:
-            from PIL import Image
-            raw = Image.open(LOGO_PATH).convert("RGBA").resize((90, 90), Image.LANCZOS)
-            self._logo = ctk.CTkImage(light_image=raw, dark_image=raw, size=(90, 90))
-            ctk.CTkLabel(self, image=self._logo, text="").pack(pady=(30, 4))
-        except Exception:
-            ctk.CTkLabel(self, text="WorkPlus", font=ctk.CTkFont(size=32, weight="bold"),
-                         text_color=C_TEAL).pack(pady=(30, 4))
+        # Header text
+        ctk.CTkLabel(self, text="WorkPlus", font=ctk.CTkFont(size=32, weight="bold"),
+                     text_color=C_TEAL).pack(pady=(30, 4))
 
         ctk.CTkLabel(self, text=settings.APP_NAME,
                      font=ctk.CTkFont(size=18, weight="bold"), text_color=C_TEXT).pack()
@@ -474,9 +468,9 @@ class LoginWindow(ctk.CTk):
 
         # Camera canvas with rounded corners
         canvas_frame = ctk.CTkFrame(self._step_container, fg_color=C_BORDER, corner_radius=16)
-        canvas_frame.pack(padx=24, pady=8)
+        canvas_frame.pack(padx=24, pady=(8, 6))
         import tkinter as tk
-        self._cam_canvas = tk.Canvas(canvas_frame, width=360, height=270,
+        self._cam_canvas = tk.Canvas(canvas_frame, width=360, height=240,
                                       bg="#0b0e17", highlightthickness=0)
         self._cam_canvas.pack(padx=2, pady=2)
 
@@ -489,7 +483,7 @@ class LoginWindow(ctk.CTk):
             height=40, fg_color=C_BORDER, hover_color="#374151",
             command=self._cancel_face,
         )
-        self._face_btn.pack(padx=24, fill="x", pady=(4, 16))
+        self._face_btn.pack(padx=24, fill="x", pady=(10, 18))
 
         # Start face check in background
         self._face_running = True

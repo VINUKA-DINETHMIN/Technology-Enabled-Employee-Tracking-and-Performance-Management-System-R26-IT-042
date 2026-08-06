@@ -450,51 +450,54 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
                 top_app = str(item.get("top_app") or "-")
                 idle_ratio = float(item.get("idle_ratio", 0.0) or 0.0)
 
+                # Consistent column widths for alignment
                 ctk.CTkLabel(
                     row,
                     text=_fmt_time(item.get("timestamp", "")),
                     text_color=C_MUTED,
                     font=ctk.CTkFont(size=11),
-                    width=65,
-                ).pack(side="left", padx=(8, 4), pady=6)
+                    width=50,
+                ).pack(side="left", padx=6, pady=6)
                 ctk.CTkLabel(
                     row,
                     text=f"Risk {risk:.1f}",
                     text_color=_risk_color(risk),
                     font=ctk.CTkFont(size=11, weight="bold"),
-                    width=85,
-                ).pack(side="left", padx=4)
+                    width=75,
+                ).pack(side="left", padx=6)
                 ctk.CTkLabel(
                     row,
                     text=f"Prod {prod:.0f}%",
                     text_color=C_TEXT,
                     font=ctk.CTkFont(size=11),
-                    width=80,
-                ).pack(side="left", padx=4)
+                    width=70,
+                ).pack(side="left", padx=6)
                 ctk.CTkLabel(
                     row,
                     text=f"Idle {idle_ratio:.2f}",
                     text_color=C_TEXT,
                     font=ctk.CTkFont(size=11),
-                    width=75,
-                ).pack(side="left", padx=4)
+                    width=70,
+                ).pack(side="left", padx=6)
                 ctk.CTkLabel(
                     row,
                     text=f"App {top_app}",
                     text_color=C_TEXT,
                     font=ctk.CTkFont(size=11),
+                    width=100,
                 ).pack(side="left", padx=6)
                 ctk.CTkLabel(
                     row,
                     text=lbl.replace("_", " ").title(),
                     text_color=C_AMBER if "risk" in lbl else C_GREEN,
                     font=ctk.CTkFont(size=11),
-                ).pack(side="right", padx=(4, 8))
+                    width=110,
+                ).pack(side="right", padx=6)
 
                 ctk.CTkButton(
                     row,
                     text="View",
-                    width=52,
+                    width=50,
                     height=24,
                     fg_color=C_SIDEBAR,
                     hover_color=C_BLUE,
@@ -505,13 +508,13 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
                 ctk.CTkButton(
                     row,
                     text="Delete",
-                    width=58,
+                    width=56,
                     height=24,
                     fg_color="#7f1d1d",
                     hover_color="#991b1b",
                     font=ctk.CTkFont(size=10, weight="bold"),
                     command=lambda d=item: self._delete_activity_log(emp_id, d),
-                ).pack(side="right", padx=4)
+                ).pack(side="right", padx=6)
 
         ctk.CTkFrame(lgf, fg_color="transparent", height=8).pack()
 
@@ -585,25 +588,41 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
         self._ss_poll_after_id = self.after(10000, self._poll_screenshots)  # Poll every 10 seconds instead of 3
 
     def _force_screenshot(self, emp_id: str) -> None:
-        if not self._db or not self._db.is_connected: return
         import uuid
+        if not self._db or not self._db.is_connected:
+            messagebox.showerror("Error", "Database connection unavailable. Cannot send command.")
+            return
         try:
             col = self._db.get_collection("commands")
-            if col is not None:
-                now = datetime.utcnow()
-                expires = (now + timedelta(minutes=5)).isoformat()
-                col.insert_one({
-                    "command_id": str(uuid.uuid4()),
-                    "target_user_id": emp_id,
-                    "command_type": "force_screenshot",
-                    "status": "pending",
-                    "timestamp": now.isoformat(),
-                    "expires_at": expires
-                })
+            if col is None:
+                messagebox.showerror("Error", "Commands collection unavailable.")
+                return
+
+            now = datetime.utcnow()
+            # Extend expiry slightly to reduce chance of accidental expiry
+            expires = (now + timedelta(minutes=10)).isoformat()
+            doc = {
+                "command_id": str(uuid.uuid4()),
+                "target_user_id": emp_id,
+                "command_type": "force_screenshot",
+                "status": "pending",
+                "timestamp": now.isoformat(),
+                "expires_at": expires
+            }
+            col.insert_one(doc)
 
             # Trigger quick UI refresh attempts so new screenshot appears as soon as written.
             self._schedule_screenshot_refresh(initial_delay_ms=800)
-        except Exception: pass
+            messagebox.showinfo("Command Sent", "Force screenshot command sent to employee.")
+
+            # Start a short async wait to check whether the command was accepted
+            try:
+                self._wait_for_command_ack(doc["command_id"], timeout_sec=20)
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Failed to send force_screenshot command: %s", exc)
+            messagebox.showerror("Error", f"Failed to send command: {exc}")
 
     def _resend_mfa(self) -> None:
         from common.email_utils import send_mfa_setup_email
@@ -844,6 +863,66 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
         except Exception as exc:
             logger.debug("Anti-spoofing UI render error: %s", exc)
 
+    def _wait_for_command_ack(self, command_id: str, timeout_sec: int = 20) -> None:
+        """Poll the `commands` collection for the given command_id until status changes or timeout.
+
+        Runs asynchronously on the Tk event loop using `after` to avoid blocking.
+        """
+        start = time.time()
+
+        def _check():
+            try:
+                if not self._db or not self._db.is_connected:
+                    # Try again a few times; DB may be transiently unavailable
+                    if time.time() - start < timeout_sec:
+                        self.after(1000, _check)
+                    else:
+                        messagebox.showwarning("Command Status", "Could not confirm command acceptance (DB offline).")
+                    return
+
+                col = self._db.get_collection("commands")
+                if col is None:
+                    if time.time() - start < timeout_sec:
+                        self.after(1000, _check)
+                    else:
+                        messagebox.showwarning("Command Status", "Commands collection unavailable.")
+                    return
+
+                doc = col.find_one({"command_id": command_id})
+                if not doc:
+                    if time.time() - start < timeout_sec:
+                        self.after(1000, _check)
+                    else:
+                        messagebox.showwarning("Command Status", "Command not found in database.")
+                    return
+
+                status = doc.get("status", "pending")
+                if status == "pending":
+                    if time.time() - start < timeout_sec:
+                        self.after(1000, _check)
+                    else:
+                        messagebox.showinfo("Command Status", "Command still pending (no response from employee).")
+                    return
+
+                # Show final status
+                if status == "processing":
+                    messagebox.showinfo("Command Accepted", "Employee has accepted the command and is processing it.")
+                elif status == "completed":
+                    messagebox.showinfo("Command Completed", "Employee has completed the command.")
+                elif status == "failed":
+                    messagebox.showerror("Command Failed", f"Employee reported failure: {doc.get('error')}")
+                else:
+                    messagebox.showinfo("Command Status", f"Command status: {status}")
+            except Exception as exc:
+                logger.debug("_wait_for_command_ack check error: %s", exc)
+                if time.time() - start < timeout_sec:
+                    self.after(1000, _check)
+                else:
+                    messagebox.showwarning("Command Status", "Unable to determine command status.")
+
+        # Kick off the first check
+        self.after(1000, _check)
+
     def _trigger_antispoofing_check(self, emp_id: str) -> None:
         """Send antispoofing check command to employee device."""
         try:
@@ -858,9 +937,14 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
                 "command_type": "start_antispoofing_check",
                 "status": "pending",
                 "created_at": datetime.utcnow().isoformat(),
-                "expires_at": (datetime.utcnow() + timedelta(minutes=5)).isoformat()
+                "expires_at": (datetime.utcnow() + timedelta(minutes=10)).isoformat()
             }
-            col.insert_one(cmd)
+            try:
+                col.insert_one(cmd)
+            except Exception as exc:
+                logger.exception("Failed to send antispoofing command: %s", exc)
+                messagebox.showerror("Error", f"Failed to initiate verification: {exc}")
+                return
 
             # Show status message
             messagebox.showinfo(
@@ -869,6 +953,10 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
                 "The employee will see a camera prompt.\n"
                 "Results will appear below in 10-15 seconds."
             )
+            try:
+                self._wait_for_command_ack(cmd["command_id"], timeout_sec=25)
+            except Exception:
+                pass
 
             # Schedule refresh
             self.after(3000, lambda: self._update_antispoofing_display(
@@ -1673,6 +1761,17 @@ class AdminPanel(ctk.CTk):
         header.pack_propagate(False)
         
         ctk.CTkLabel(header, text="Live Screen Monitor Grid", font=ctk.CTkFont(size=18, weight="bold")).pack(side="left", padx=20)
+
+        ctk.CTkButton(
+            header,
+            text="Clear",
+            width=88,
+            height=30,
+            fg_color="#7f1d1d",
+            hover_color="#991b1b",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._clear_live_grid_view,
+        ).pack(side="right", padx=20)
         
         self._grid_scroll = ctk.CTkScrollableFrame(frame, fg_color="transparent")
         self._grid_scroll.pack(fill="both", expand=True)
@@ -1968,6 +2067,8 @@ class AdminPanel(ctk.CTk):
             logger.exception("Failed to launch efficiency window")
             messagebox.showerror("Efficiency Window", f"Failed to launch efficiency window: {exc}")
 
+
+    #basline window luncher
     def _open_baseline_window(self) -> None:
         script_path = _PROJECT_ROOT / "C1_user_Behavioural_Baseline" / "dashboard.py"
         if not script_path.exists():
@@ -1982,6 +2083,31 @@ class AdminPanel(ctk.CTk):
 
     def _refresh_live_grid(self) -> None:
         threading.Thread(target=self._fetch_live_grid, daemon=True).start()
+
+    def _clear_live_grid_view(self) -> None:
+        """Clear the current live monitor view without changing employee-side streams."""
+        if not hasattr(self, "_grid_items"):
+            self._grid_items = {}
+        if not hasattr(self, "_image_cache"):
+            self._image_cache = {}
+
+        if not messagebox.askyesno(
+            "Clear Live Grid",
+            "Clear the current live monitor tiles from this view?\n\n"
+            "This only clears the admin display. Active employee streams will appear again on the next refresh.",
+        ):
+            return
+
+        try:
+            for item in list(self._grid_items.values()):
+                try:
+                    item["frame"].destroy()
+                except Exception:
+                    pass
+            self._grid_items.clear()
+            self._image_cache.clear()
+        except Exception as exc:
+            messagebox.showerror("Clear Live Grid", f"Could not clear live grid: {exc}")
 
     def _fetch_live_grid(self) -> None:
         if not self._db or not self._db.is_connected: return
