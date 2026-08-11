@@ -11,6 +11,11 @@ import time
 import joblib
 import pandas as pd
 
+try:
+    from lime.lime_tabular import LimeTabularExplainer
+except Exception:
+    LimeTabularExplainer = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -20,6 +25,7 @@ class EmployeeEfficiencyResult:
     full_name: str
     predicted_label: str
     confidence: float
+    efficiency_score: float
     productivity_score_input: float
     workload_score: float
     total_tasks_assigned: int
@@ -34,6 +40,7 @@ class EmployeeProductivityReport:
     full_name: str
     predicted_label: str
     confidence: float
+    efficiency_score: float
     productivity_score: float
     workload_score: float
     total_tasks_assigned: int
@@ -169,6 +176,11 @@ class EfficiencyPredictionService:
                     full_name=stats["full_name"],
                     predicted_label=str(label),
                     confidence=confidence,
+                    efficiency_score=self._calculate_efficiency_score(
+                        float(stats["workload_score"]),
+                        str(label),
+                        confidence,
+                    ),
                     productivity_score_input=float(stats["productivity_score_input"]),
                     workload_score=float(stats["workload_score"]),
                     total_tasks_assigned=int(stats["total_tasks_assigned"]),
@@ -255,6 +267,7 @@ class EfficiencyPredictionService:
             full_name=target.full_name,
             predicted_label=target.predicted_label,
             confidence=target.confidence,
+            efficiency_score=target.efficiency_score,
             productivity_score=target.productivity_score_input,
             workload_score=target.workload_score,
             total_tasks_assigned=assigned,
@@ -267,6 +280,184 @@ class EfficiencyPredictionService:
             summary=summary,
             insights=insights,
         )
+
+    def get_employee_lime_explanation(
+        self,
+        db_client,
+        employee_id: str,
+        period_start: Optional[datetime] = None,
+        period_end: Optional[datetime] = None,
+        max_features: int = 5,
+    ) -> list[str]:
+        # Build a local LIME explanation from the current employee slice without changing the model or stored data.
+        target_id = self._normalize_employee_id(employee_id)
+        if not target_id:
+            return ["No employee was selected for the explanation."]
+
+        if self._model is None or self._label_encoder is None:
+            self.load()
+
+        if db_client is None or not getattr(db_client, "is_connected", False):
+            return ["No database connection is available for the explanation."]
+
+        emp_col = db_client.get_collection("employees")
+        task_col = db_client.get_collection("tasks")
+        activity_col = db_client.get_collection("activity_logs")
+
+        if emp_col is None:
+            return ["No employee data is available for explanation."]
+
+        employees = list(emp_col.find({}, {"_id": 0}))
+        if not employees:
+            return ["No employee records were found for explanation."]
+
+        employee_lookup: dict[str, dict] = {}
+        for emp in employees:
+            employee_id_value = str(emp.get("employee_id") or "").strip()
+            if not employee_id_value:
+                continue
+            employee_lookup.setdefault(self._normalize_employee_id(employee_id_value), emp)
+
+        tasks_by_employee: dict[str, list[dict]] = {key: [] for key in employee_lookup}
+        if task_col is not None:
+            for task in task_col.find({}, {"_id": 0}):
+                raw_employee_id = str(task.get("employee_id") or "").strip()
+                if not raw_employee_id:
+                    continue
+                normalized_employee_id = self._normalize_employee_id(raw_employee_id)
+                if normalized_employee_id not in employee_lookup:
+                    continue
+                tasks_by_employee.setdefault(normalized_employee_id, []).append(task)
+
+        activity_by_employee: dict[str, list[dict]] = {key: [] for key in employee_lookup}
+        if activity_col is not None:
+            for doc in activity_col.find({}, {"_id": 0, "productivity_score": 1, "timestamp": 1, "user_id": 1}):
+                raw_user_id = str(doc.get("user_id") or "").strip()
+                if not raw_user_id:
+                    continue
+                normalized_user_id = self._normalize_employee_id(raw_user_id)
+                if normalized_user_id not in employee_lookup:
+                    continue
+                activity_by_employee.setdefault(normalized_user_id, []).append(doc)
+
+        rows: list[dict] = []
+        meta: list[dict] = []
+        target_index = None
+
+        for idx, (employee_key, emp) in enumerate(employee_lookup.items()):
+            employee_id_value = str(emp.get("employee_id") or "").strip()
+            if not employee_id_value:
+                continue
+
+            tasks = self._filter_tasks_for_period(tasks_by_employee.get(employee_key, []), period_start, period_end)
+            activity_logs = self._filter_activity_for_period(activity_by_employee.get(employee_key, []), period_start, period_end)
+
+            row, stats = self._build_feature_row(emp, tasks, activity_logs)
+            rows.append(row)
+            meta.append(stats)
+
+            if self._normalize_employee_id(employee_id_value) == target_id:
+                target_index = len(rows) - 1
+
+        if target_index is None or not rows:
+            return ["No explanation could be generated for the selected employee."]
+
+        frame = pd.DataFrame(rows, columns=self._feature_names)
+        if len(frame) < 2:
+            return ["Not enough employee data is available yet to generate a reliable LIME explanation."]
+
+        if LimeTabularExplainer is None:
+            return self._fallback_explanation(meta[target_index], target_id)
+
+        preprocessor = getattr(self._model, "named_steps", {}).get("preprocessor")
+        model = getattr(self._model, "named_steps", {}).get("model")
+        if preprocessor is None or model is None:
+            return ["The model structure does not support LIME explanation in the current run."]
+
+        transformed = preprocessor.transform(frame)
+        if hasattr(transformed, "toarray"):
+            transformed = transformed.toarray()
+        transformed = transformed.astype(float, copy=False)
+
+        feature_names = [str(name) for name in preprocessor.get_feature_names_out()]
+        class_names = [str(name) for name in getattr(self._label_encoder, "classes_", [])]
+
+        explainer = LimeTabularExplainer(
+            training_data=transformed,
+            feature_names=feature_names,
+            class_names=class_names,
+            mode="classification",
+            discretize_continuous=True,
+        )
+
+        target_label = str(meta[target_index]["employee_id"])
+        target_row = transformed[target_index]
+        prediction = str(self._label_encoder.inverse_transform(self._model.predict(frame))[target_index])
+        label_index = int(self._label_encoder.transform([prediction])[0])
+
+        friendly_lines: list[str] = []
+
+        explanation = explainer.explain_instance(
+            data_row=target_row,
+            predict_fn=model.predict_proba,
+            num_features=max(1, min(max_features, len(feature_names))),
+            top_labels=1,
+        )
+
+        raw_factors = explanation.as_list(label=label_index) or explanation.as_list()
+        for factor, weight in raw_factors[:max_features]:
+            factor_line = self._format_lime_factor(factor, float(weight), prediction)
+            if factor_line:
+                friendly_lines.append(factor_line)
+
+        if not friendly_lines:
+            friendly_lines.append(f"The model did not produce a detailed factor breakdown for {target_label}.")
+
+        return friendly_lines
+
+    def _fallback_explanation(self, stats: dict, employee_id: str) -> list[str]:
+        lines = ["A detailed LIME breakdown could not be generated in this run, so the system is using a plain-language fallback explanation."]
+
+        assigned = int(stats.get("total_tasks_assigned", 0) or 0)
+        pending = int(stats.get("total_tasks_pending", 0) or 0)
+        on_time = int(stats.get("total_tasks_completed_on_time", 0) or 0)
+        late = int(stats.get("total_tasks_completed_late", 0) or 0)
+        completed = on_time + late
+        workload = float(stats.get("workload_score", 0.0) or 0.0)
+        prod_input = float(stats.get("productivity_score_input", 0.0) or 0.0)
+
+        if assigned == 0:
+            lines.append("No tasks were assigned in this period, so the score is based mostly on activity signals.")
+        else:
+            backlog_ratio = pending / assigned
+            completion_ratio = completed / assigned
+            if backlog_ratio >= 0.5:
+                lines.append("A large share of tasks is still pending, which lowers the efficiency score.")
+            elif backlog_ratio <= 0.2:
+                lines.append("Most assigned tasks are not pending, which supports a stronger efficiency score.")
+
+            if completion_ratio >= 0.8:
+                lines.append("Task completion is strong for this employee during the selected period.")
+            elif completion_ratio < 0.5:
+                lines.append("Only a small portion of assigned tasks is completed, which reduces the score.")
+
+            if completed > 0 and late > on_time:
+                lines.append("More tasks were completed late than on time, which pulls the score down.")
+
+        if prod_input >= 70:
+            lines.append("Activity productivity is strong, so the model sees stable work behavior.")
+        elif prod_input < 40:
+            lines.append("Activity productivity is low, which usually indicates weaker work signals.")
+
+        if workload >= 70:
+            lines.append("Workload performance is healthy and helps the employee score.")
+        elif workload < 40:
+            lines.append("Workload performance is weak because of limited completion or high pending work.")
+
+        if len(lines) == 1:
+            lines.append(f"No additional explanation signals were strong for {employee_id} in this period.")
+
+        return lines
 
     def _build_feature_row(self, emp: dict, tasks: list[dict], activity_logs: list[dict]) -> tuple[dict, dict]:
         # Assemble model-ready inputs and the reporting metadata from employee, task, and activity data.
@@ -417,6 +608,7 @@ class EfficiencyPredictionService:
 
         return ordered, stats
 
+    # Helper methods for data parsing, normalization, caching, and feature extraction.
     @staticmethod
     def _to_float(value, default: float = 0.0) -> float:
         try:
@@ -426,6 +618,7 @@ class EfficiencyPredictionService:
         except Exception:
             return default
 
+    # For categorical features, use the most common value or a default if no data is available.
     @staticmethod
     def _mode_or_default(values: list[str], default: str) -> str:
         if not values:
@@ -439,6 +632,7 @@ class EfficiencyPredictionService:
     def _normalize_employee_id(value: str) -> str:
         return str(value or "").strip().lower()
 
+    # Cache keys are based on the database name and formatted period start,end datetimes 
     @staticmethod
     def _period_cache_key(value: Optional[datetime]) -> str:
         if value is None:
@@ -511,6 +705,64 @@ class EfficiencyPredictionService:
         if not values:
             return None
         return sum(values) / len(values)
+
+    @staticmethod
+    def _format_lime_factor(feature_term: str, weight: float, predicted_label: str) -> str:
+        term = str(feature_term)
+        base_term = term.split(" <= ")[0].split(" > ")[0].split(" = ")[0].strip()
+        plain_name = EfficiencyPredictionService._plain_feature_name(base_term)
+        if plain_name.lower().startswith("employee id") or plain_name.lower().startswith("employee name"):
+            return ""
+
+        direction = "helped improve" if weight >= 0 else "pulled down"
+        return f"{plain_name} {direction} the employee's score."
+
+    @staticmethod
+    def _plain_feature_name(feature_name: str) -> str:
+        cleaned = str(feature_name).replace("cat__", "").replace("num__", "")
+        cleaned = cleaned.replace("_", " ").strip()
+
+        replacements = [
+            ("workload score", "Workload"),
+            ("productivity score", "Activity productivity"),
+            ("total tasks pending", "Pending tasks"),
+            ("total tasks completed on time", "On-time completions"),
+            ("total tasks completed late", "Late completions"),
+            ("total tasks assigned", "Assigned tasks"),
+            ("completion ratio", "Completion rate"),
+            ("on time ratio", "On-time completion rate"),
+            ("backlog ratio", "Backlog"),
+            ("average time deviation", "Schedule timing"),
+            ("similar tasks completed count", "Similar completed tasks"),
+            ("allocated hours", "Allocated time"),
+            ("actual hours", "Actual time"),
+            ("task priority", "Task priority"),
+            ("task category", "Task category"),
+            ("task status", "Task status"),
+            ("department", "Department"),
+            ("role", "Role"),
+        ]
+
+        lowered = cleaned.lower()
+        for needle, label in replacements:
+            if needle in lowered:
+                return label
+
+        return cleaned.title() if cleaned else "A model feature"
+
+    @staticmethod
+    def _label_score(label: str) -> float:
+        return {
+            "high": 100.0,
+            "medium": 65.0,
+            "low": 30.0,
+        }.get(str(label).strip().lower(), 0.0)
+
+    @classmethod
+    def _calculate_efficiency_score(cls, workload_score: float, predicted_label: str, confidence: float) -> float:
+        label_score = cls._label_score(predicted_label)
+        score = 0.70 * float(workload_score) + 0.30 * (label_score * float(confidence))
+        return float(round(max(0.0, min(100.0, score)), 3))
 
     def _filter_tasks_for_period(
         self,
