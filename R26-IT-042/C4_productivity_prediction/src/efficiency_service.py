@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 import threading
 import time
 
 import joblib
+import numpy as np
 import pandas as pd
 
 try:
@@ -52,6 +53,19 @@ class EmployeeProductivityReport:
     backlog_ratio: float
     summary: str
     insights: list[str]
+
+
+@dataclass
+class EmployeeWeeklyForecast:
+    employee_id: str
+    full_name: str
+    available: bool
+    message: str
+    history_weeks: list[str] = field(default_factory=list)
+    history_scores: list[float] = field(default_factory=list)
+    forecast_week: str = ""
+    forecast_score: Optional[float] = None
+    source_weeks: int = 0
 
 
 class EfficiencyPredictionService:
@@ -414,6 +428,186 @@ class EfficiencyPredictionService:
             friendly_lines.append(f"The model did not produce a detailed factor breakdown for {target_label}.")
 
         return friendly_lines
+
+    def get_employee_weekly_forecast(
+        self,
+        db_client,
+        employee_id: str,
+        period_end: Optional[datetime] = None,
+        lookback_weeks: int = 8,
+        min_weeks: int = 4,
+    ) -> EmployeeWeeklyForecast:
+        target_id = self._normalize_employee_id(employee_id)
+        if not target_id:
+            return EmployeeWeeklyForecast(
+                employee_id="",
+                full_name="",
+                available=False,
+                message="No employee was selected for the forecast.",
+            )
+
+        if self._model is None or self._label_encoder is None:
+            self.load()
+
+        if db_client is None or not getattr(db_client, "is_connected", False):
+            return EmployeeWeeklyForecast(
+                employee_id=employee_id,
+                full_name=employee_id,
+                available=False,
+                message="No database connection is available for the forecast.",
+            )
+
+        emp_col = db_client.get_collection("employees")
+        task_col = db_client.get_collection("tasks")
+        activity_col = db_client.get_collection("activity_logs")
+
+        if emp_col is None or task_col is None or activity_col is None:
+            return EmployeeWeeklyForecast(
+                employee_id=employee_id,
+                full_name=employee_id,
+                available=False,
+                message="The forecast cannot be generated because one or more source collections are unavailable.",
+            )
+
+        employees = list(emp_col.find({}, {"_id": 0}))
+        if not employees:
+            return EmployeeWeeklyForecast(
+                employee_id=employee_id,
+                full_name=employee_id,
+                available=False,
+                message="No employee records are available for forecasting.",
+            )
+
+        employee_lookup: dict[str, dict] = {}
+        for emp in employees:
+            employee_id_value = str(emp.get("employee_id") or "").strip()
+            if not employee_id_value:
+                continue
+            employee_lookup.setdefault(self._normalize_employee_id(employee_id_value), emp)
+
+        emp = employee_lookup.get(target_id)
+        if emp is None:
+            return EmployeeWeeklyForecast(
+                employee_id=employee_id,
+                full_name=employee_id,
+                available=False,
+                message="No employee record was found for the selected employee.",
+            )
+
+        employee_name = str(emp.get("full_name") or emp.get("employee_id") or employee_id)
+
+        tasks = [
+            task for task in task_col.find({}, {"_id": 0})
+            if self._normalize_employee_id(str(task.get("employee_id") or "")) == target_id
+        ]
+        activity_logs = [
+            doc for doc in activity_col.find({}, {"_id": 0, "productivity_score": 1, "timestamp": 1, "user_id": 1})
+            if self._normalize_employee_id(str(doc.get("user_id") or "")) == target_id
+        ]
+
+        anchor_end = period_end or datetime.now(timezone.utc)
+        if anchor_end.tzinfo is None:
+            anchor_end = anchor_end.replace(tzinfo=timezone.utc)
+        else:
+            anchor_end = anchor_end.astimezone(timezone.utc)
+
+        history_start = anchor_end - timedelta(days=7 * max(lookback_weeks, min_weeks))
+        weekly_buckets: dict[date, dict[str, list[dict]]] = {}
+
+        for task in tasks:
+            ref_dt = self._task_reference_dt(task)
+            if ref_dt is None or ref_dt < history_start or ref_dt > anchor_end:
+                continue
+            week_start = (ref_dt - timedelta(days=ref_dt.weekday())).date()
+            bucket = weekly_buckets.setdefault(week_start, {"tasks": [], "activity": []})
+            bucket["tasks"].append(task)
+
+        for doc in activity_logs:
+            ts = self._parse_dt(doc.get("timestamp"))
+            if ts is None or ts < history_start or ts > anchor_end:
+                continue
+            week_start = (ts - timedelta(days=ts.weekday())).date()
+            bucket = weekly_buckets.setdefault(week_start, {"tasks": [], "activity": []})
+            bucket["activity"].append(doc)
+
+        if len(weekly_buckets) < min_weeks:
+            return EmployeeWeeklyForecast(
+                employee_id=str(emp.get("employee_id") or employee_id),
+                full_name=employee_name,
+                available=False,
+                message=(
+                    "Current data is not sufficient for a reliable next-week forecast. "
+                    f"At least {min_weeks} weekly history points are needed."
+                ),
+                source_weeks=len(weekly_buckets),
+            )
+
+        weekly_points: list[tuple[date, float]] = []
+        for week_start in sorted(weekly_buckets):
+            bucket = weekly_buckets[week_start]
+            row, stats = self._build_feature_row(emp, bucket["tasks"], bucket["activity"])
+            frame = pd.DataFrame([row], columns=self._feature_names)
+
+            pred_label = str(self._label_encoder.inverse_transform(self._model.predict(frame))[0])
+            confidence = float(self._model.predict_proba(frame)[0].max())
+            efficiency_score = self._calculate_efficiency_score(
+                float(stats["workload_score"]),
+                pred_label,
+                confidence,
+            )
+            weekly_points.append((week_start, efficiency_score))
+
+        if len(weekly_points) < min_weeks:
+            return EmployeeWeeklyForecast(
+                employee_id=str(emp.get("employee_id") or employee_id),
+                full_name=employee_name,
+                available=False,
+                message=(
+                    "Current data is not sufficient for a reliable next-week forecast. "
+                    f"At least {min_weeks} weekly history points are needed."
+                ),
+                source_weeks=len(weekly_points),
+            )
+
+        weekly_points = weekly_points[-lookback_weeks:]
+        week_labels = [week_start.strftime("%b %d") for week_start, _ in weekly_points]
+        week_scores = [float(score) for _, score in weekly_points]
+
+        x = np.arange(len(week_scores), dtype=float)
+        y = np.asarray(week_scores, dtype=float)
+        if len(week_scores) >= 2:
+            slope, intercept = np.polyfit(x, y, deg=1)
+            forecast_raw = float(slope * len(week_scores) + intercept)
+            fitted = slope * x + intercept
+            rmse = float(np.sqrt(np.mean((y - fitted) ** 2))) if len(week_scores) else 0.0
+            stability = max(0.0, min(1.0, 1.0 - (rmse / 30.0)))
+            trend = "improving" if slope > 0.5 else "softening" if slope < -0.5 else "stable"
+        else:
+            forecast_raw = float(week_scores[-1])
+            stability = 0.5
+            trend = "stable"
+
+        forecast_score = float(max(0.0, min(100.0, round(forecast_raw, 1))))
+        next_week_start = weekly_points[-1][0] + timedelta(days=7)
+        forecast_week = next_week_start.strftime("%b %d")
+        message = (
+            f"Based on the last {len(week_scores)} weekly data points, the employee's forecast for next week is "
+            f"{forecast_score:.1f}/100 and the recent trend appears {trend}."
+        )
+        if stability < 0.45:
+            message += " The pattern is somewhat volatile, so treat the forecast as directional rather than exact."
+
+        return EmployeeWeeklyForecast(
+            employee_id=str(emp.get("employee_id") or employee_id),
+            full_name=employee_name,
+            available=True,
+            message=message,
+            history_weeks=week_labels,
+            history_scores=week_scores,
+            forecast_week=forecast_week,
+            forecast_score=forecast_score,
+            source_weeks=len(week_scores),
+        )
 
     def _fallback_explanation(self, stats: dict, employee_id: str) -> list[str]:
         lines = ["A detailed LIME breakdown could not be generated in this run, so the system is using a plain-language fallback explanation."]
