@@ -37,9 +37,11 @@ C_BLUE = "#3b82f6"
 
 class EfficiencyWindow(ctk.CTk):
     """Standalone read-only window for per-employee efficiency prediction."""
+    
 
     def __init__(self, db: MongoDBClient, refresh_ms: int = 60_000) -> None:
         super().__init__()
+         # Database client instance
         self._db = db
         self._refresh_ms = refresh_ms
         self._service = EfficiencyPredictionService()
@@ -58,8 +60,11 @@ class EfficiencyWindow(ctk.CTk):
         self._status_var = ctk.StringVar(value="Loading model and reading data...")
 
         self._build()
+        # Schedule initial refresh after 200 ms (startup delay)
         self.after(200, self._refresh)
-
+        
+    
+    #Build and layout the Employee Efficiency dashboard UI
     def _build(self) -> None:
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", padx=18, pady=(16, 8))
@@ -134,7 +139,7 @@ class EfficiencyWindow(ctk.CTk):
         for title, width in [
             ("Employee", 230),
             ("Prediction", 130),
-            ("Confidence", 120),
+            ("Efficiency Score", 130),
             ("Input Productivity", 150),
             ("Workload", 110),
             ("Assigned", 90),
@@ -204,6 +209,7 @@ class EfficiencyWindow(ctk.CTk):
         self._last_updated_var.set(f"Last updated: {now}")
         self._status_var.set(f"Read-only prediction completed for {len(rows)} employees.")
 
+    #rendering summary in static form
     def _render_summary(self, rows) -> None:
         total = len(rows)
         high = sum(1 for r in rows if r.predicted_label.lower() == "high")
@@ -260,7 +266,7 @@ class EfficiencyWindow(ctk.CTk):
             values = [
                 (f"{r.full_name} ({r.employee_id})", 230, C_TEXT),
                 (r.predicted_label, 130, pred_color),
-                (f"{r.confidence * 100:.1f}%", 120, C_TEXT),
+                (f"{r.efficiency_score:.1f}", 130, C_TEXT),
                 (f"{r.productivity_score_input:.1f}", 150, C_TEXT),
                 (f"{r.workload_score:.1f}", 110, C_TEXT),
                 (str(r.total_tasks_assigned), 90, C_TEXT),
@@ -294,6 +300,7 @@ class EfficiencyWindow(ctk.CTk):
         period_start, period_end = self._period_range()
         self._executor.submit(self._fetch_employee_report, employee_id, period_start, period_end)
 
+    # Fetch detailed report for one employee and show in new window (background)
     def _fetch_employee_report(self, employee_id: str, period_start, period_end) -> None:
         try:
             report = self._service.get_employee_productivity_report(
@@ -302,17 +309,18 @@ class EfficiencyWindow(ctk.CTk):
                 period_start=period_start,
                 period_end=period_end,
             )
-            self.after(0, lambda: self._show_employee_details(report, employee_id))
+            self.after(0, lambda: self._show_employee_details(report, employee_id, period_start, period_end))
         except Exception as exc:
             logger.exception("Failed to build employee productivity report")
             self.after(0, lambda: messagebox.showerror("Productivity Report", f"Failed to load report: {exc}"))
 
-    def _show_employee_details(self, report, employee_id: str) -> None:
+    def _show_employee_details(self, report, employee_id: str, period_start=None, period_end=None) -> None:
         if report is None:
             self._status_var.set("No report available for selected employee.")
             messagebox.showinfo("Productivity Report", f"No report data available for {employee_id} in this period.")
             return
-
+        
+        # color based on predicted label
         pred_color = {
             "high": C_GREEN,
             "medium": C_AMBER,
@@ -352,7 +360,7 @@ class EfficiencyWindow(ctk.CTk):
         metric_cards = [
             ("Prediction", str(report.predicted_label), pred_color),
             ("Confidence", f"{report.confidence * 100:.1f}%", C_TEAL),
-            ("Prod. Score", f"{report.productivity_score:.1f}", C_BLUE),
+            ("Efficiency Score", f"{report.efficiency_score:.1f}", C_BLUE),
             ("Workload", f"{report.workload_score:.1f}", C_AMBER),
         ]
 
@@ -402,6 +410,66 @@ class EfficiencyWindow(ctk.CTk):
             ctk.CTkLabel(
                 content,
                 text=f"- {insight}",
+                text_color=C_MUTED,
+                font=ctk.CTkFont(size=12),
+                justify="left",
+                wraplength=780,
+            ).pack(anchor="w", padx=12, pady=2)
+
+        lime_lines = self._service.get_employee_lime_explanation(
+            self._db,
+            employee_id=employee_id,
+            period_start=period_start,
+            period_end=period_end,
+        )
+
+        efficiency_state = "strong" if report.efficiency_score >= 70 else "needs attention" if report.efficiency_score < 50 else "mixed"
+        workload_state = "healthy" if report.workload_score >= 70 else "strained" if report.workload_score < 50 else "moderate"
+        insight_summary = " ".join(report.insights[:3]) if report.insights else "The model did not find any strong warning or support signals beyond the score itself."
+
+        ctk.CTkLabel(
+            content,
+            text="Business interpretation",
+            text_color=C_TEXT,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
+        ctk.CTkLabel(
+            content,
+            text=(
+                f"This employee's efficiency score is {report.efficiency_score:.1f}/100, so the current picture is {efficiency_state}. "
+                f"The workload score is {report.workload_score:.1f}/100, which is {workload_state}. {insight_summary} "
+                "Taken together, this helps a manager or HR reviewer decide whether the employee is performing well, holding steady, or slipping because of unfinished work, late completion, or weaker activity patterns."
+            ),
+            text_color=C_MUTED,
+            font=ctk.CTkFont(size=12),
+            wraplength=780,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+
+        ctk.CTkLabel(
+            content,
+            text="How to read the model output",
+            text_color=C_TEXT,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+
+        ctk.CTkLabel(
+            content,
+            text=(
+                "The lines below are the main reasons the model leaned toward this result. They describe whether task completion, pending work, "
+                "and activity patterns helped the employee's score or pulled it down."
+            ),
+            text_color=C_MUTED,
+            font=ctk.CTkFont(size=12),
+            wraplength=780,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+
+        for line in lime_lines:
+            ctk.CTkLabel(
+                content,
+                text=f"- {line}",
                 text_color=C_MUTED,
                 font=ctk.CTkFont(size=12),
                 justify="left",

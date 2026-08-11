@@ -1,0 +1,38 @@
+{
+  "model": "random_forest_stacker",
+  "features": [
+    "mean_dwell_time",
+    "std_dwell_time",
+    "mean_flight_time",
+    "typing_speed_wpm",
+    "error_rate",
+    "mean_velocity",
+    "std_velocity",
+    "mean_acceleration",
+    "mean_curvature",
+    "click_frequency",
+    "idle_ratio",
+    "app_switch_frequency",
+    "active_app_entropy",
+    "total_focus_duration",
+    "session_duration_min",
+    "geolocation_deviation",
+    "wifi_ssid_match",
+    "device_fingerprint_match",
+    "face_liveness_score",
+    "if_score",
+    "ae_score",
+    "composite_raw"
+  ],
+  "validation_thresholds": {
+    "fpr_0.01": 0.5,
+    "fpr_0.02": 0.45714285714285713,
+    "fpr_0.05": 0.3333333333333333
+  },
+  "tier_thresholds": {
+    "high": 0.5,
+    "medium": 0.3333333333333333
+  },
+  "recommended_operating_threshold": 0.3333333333333333,
+  "notes": "All thresholds selected on validation split only."
+}

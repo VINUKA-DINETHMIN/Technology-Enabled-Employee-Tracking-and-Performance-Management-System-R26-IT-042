@@ -13,6 +13,7 @@ Model file locations
 
 from __future__ import annotations
 
+import json
 import logging
 import pickle
 from pathlib import Path
@@ -31,6 +32,9 @@ _AE_THRESHOLD_PATH = _MODELS_DIR / "ae_threshold.pkl"
 _COMPOSITE_ISO_PATH = _MODELS_DIR / "composite_iso.pkl"
 _META_LR_PATH = _MODELS_DIR / "meta_lr.pkl"
 _ENSEMBLE_CONFIG_PATH = _MODELS_DIR / "ensemble_config.json"
+_SUPERVISED_STACKER_PATH = _MODELS_DIR / "supervised_stacker.pkl"
+_SUPERVISED_STACKER_ISO_PATH = _MODELS_DIR / "supervised_stacker_iso.pkl"
+_SUPERVISED_CONFIG_PATH = _MODELS_DIR / "supervised_config.json"
 
 _IF_WEIGHT = 0.6
 _AE_WEIGHT = 0.4
@@ -81,6 +85,11 @@ class AnomalyEngine:
         self._if_weight = _IF_WEIGHT
         self._ae_weight = _AE_WEIGHT
         self._ensemble_threshold = None
+        self._supervised_stacker = None
+        self._supervised_iso = None
+        self._supervised_enabled = False
+        self._supervised_feature_count = len(FEATURE_COLUMNS) + 3
+        self._supervised_threshold = None
         self._model_loaded = False
         self._last_load_error: Optional[str] = None
 
@@ -127,6 +136,11 @@ class AnomalyEngine:
         self._ae_threshold = None
         self._composite_iso = None
         self._meta_lr = None
+        self._supervised_stacker = None
+        self._supervised_iso = None
+        self._supervised_enabled = False
+        self._supervised_feature_count = len(FEATURE_COLUMNS) + 3
+        self._supervised_threshold = None
         self._model_loaded = False
         self._last_load_error = None
 
@@ -212,6 +226,39 @@ class AnomalyEngine:
             except Exception as exc:
                 logger.warning("Could not load meta calibrator (%s): %s", _META_LR_PATH, exc)
                 self._meta_lr = None
+
+        # Optional supervised stacker: never disable baseline model path if this fails.
+        if (
+            _SUPERVISED_STACKER_PATH.exists()
+            and _SUPERVISED_STACKER_ISO_PATH.exists()
+            and _SUPERVISED_CONFIG_PATH.exists()
+        ):
+            try:
+                with open(_SUPERVISED_STACKER_PATH, "rb") as f:
+                    self._supervised_stacker = pickle.load(f)
+                with open(_SUPERVISED_STACKER_ISO_PATH, "rb") as f:
+                    self._supervised_iso = pickle.load(f)
+                with open(_SUPERVISED_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    sup_cfg = json.load(f)
+
+                feature_list = sup_cfg.get("features", [])
+                if isinstance(feature_list, list) and len(feature_list) > 0:
+                    self._supervised_feature_count = int(len(feature_list))
+                threshold = sup_cfg.get("recommended_operating_threshold")
+                if threshold is not None:
+                    self._supervised_threshold = float(threshold)
+
+                self._supervised_enabled = True
+                logger.info(
+                    "Supervised stacker enabled (%s, threshold=%s)",
+                    _SUPERVISED_STACKER_PATH,
+                    self._supervised_threshold,
+                )
+            except Exception as exc:
+                logger.warning("Could not enable supervised stacker: %s", exc)
+                self._supervised_stacker = None
+                self._supervised_iso = None
+                self._supervised_enabled = False
 
         self._model_loaded = True
         self._last_load_error = None
@@ -304,6 +351,33 @@ class AnomalyEngine:
                         calibrated_risk = max(0.0, min(100.0, iso_val * 100.0 if iso_val <= 1.5 else iso_val))
                 except Exception as exc:
                     logger.debug("Composite calibration skipped: %s", exc)
+
+            if self._supervised_enabled and self._supervised_stacker is not None:
+                try:
+                    x_sup = features.reshape(1, -1)
+                    x_sup = self._align_feature_length(x_sup, len(FEATURE_COLUMNS))
+
+                    ae_for_stack = ae_risk if ae_risk is not None else if_risk
+                    stack_aux = np.array(
+                        [[if_risk / 100.0, ae_for_stack / 100.0, base_risk / 100.0]],
+                        dtype=np.float64,
+                    )
+                    x_stack = np.hstack([x_sup.astype(np.float64), stack_aux])
+
+                    if x_stack.shape[1] != self._supervised_feature_count:
+                        raise ValueError(
+                            f"supervised_feature_mismatch: got {x_stack.shape[1]}, expected {self._supervised_feature_count}"
+                        )
+
+                    stack_prob = float(self._supervised_stacker.predict_proba(x_stack)[0, 1])
+                    if self._supervised_iso is not None:
+                        stack_prob = float(np.asarray(self._supervised_iso.transform([stack_prob])).reshape(-1)[0])
+
+                    if np.isfinite(stack_prob):
+                        stack_prob = max(0.0, min(1.0, stack_prob))
+                        return round(stack_prob * 100.0, 2)
+                except Exception as exc:
+                    logger.warning("Supervised stacker scoring failed; falling back to baseline risk: %s", exc)
 
             if calibrated_risk is not None:
                 return round(calibrated_risk, 2)
