@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from C3_activity_monitoring.src.mouse_tracker import MouseTracker
     from C3_activity_monitoring.src.app_usage_monitor import AppUsageMonitor
     from C3_activity_monitoring.src.idle_detector import IdleDetector
+    from C3_activity_monitoring.src.macro_detector import MacroDetectorEngine
 
 
 def _device_fingerprint() -> str:
@@ -80,6 +81,7 @@ class FeatureExtractor:
         location_context: Optional[dict] = None,
         wifi_ssid_match: bool = False,
         face_liveness_score: float = 0.0,
+        macro_detector: Optional["MacroDetectorEngine"] = None,
     ) -> None:
         self._keyboard = keyboard
         self._mouse = mouse
@@ -94,6 +96,7 @@ class FeatureExtractor:
         self._face_liveness_score = face_liveness_score
         self._device_fp = _device_fingerprint()
         self._known_fp: Optional[str] = None  # loaded from MongoDB on first call
+        self._macro_detector = macro_detector
 
     # ------------------------------------------------------------------
     # Public API
@@ -209,6 +212,14 @@ class FeatureExtractor:
             "device_fingerprint_match": device_fp_match,
             "face_liveness_score": self._face_liveness_score,
         }
+
+        # ── Macro Detection Features (NEW) ───────────────────────────
+        if self._macro_detector is not None:
+            try:
+                macro_features = self._macro_detector.get_features()
+                feature_vector.update(macro_features)
+            except Exception as exc:
+                logger.warning("MacroDetectorEngine.get_features() failed: %s", exc)
 
         return feature_vector
 
