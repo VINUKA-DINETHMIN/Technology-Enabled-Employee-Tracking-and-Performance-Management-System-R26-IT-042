@@ -79,9 +79,13 @@ class EfficiencyPredictionService:
         base = Path(__file__).resolve().parent
         self._model_path = model_path or (base / "productivity_classifier.joblib")
         self._label_encoder_path = label_encoder_path or (base / "label_encoder.joblib")
+        self._forecast_model_path = base / "employee_productivity_forecast_model.joblib"
         self._model = None
         self._label_encoder = None
         self._feature_names: list[str] = []
+        self._forecast_model = None
+        self._forecast_feature_cols: list[str] = []
+        self._forecast_model_loaded = False
 
     def load(self) -> None:
         # Load the trained model and label encoder, then capture the model's expected feature order.
@@ -91,6 +95,35 @@ class EfficiencyPredictionService:
         if names is None:
             raise ValueError("Model does not expose feature_names_in_.")
         self._feature_names = [str(n) for n in names]
+
+    def _load_forecast_model(self) -> bool:
+        """Load the real-time forecasting model if available."""
+        if self._forecast_model_loaded:
+            return self._forecast_model is not None
+        
+        try:
+            if self._forecast_model_path.exists():
+                loaded_obj = joblib.load(self._forecast_model_path)
+                # The joblib file is a dict containing the model and metadata
+                if isinstance(loaded_obj, dict):
+                    self._forecast_model = loaded_obj.get('model')
+                    self._forecast_feature_cols = loaded_obj.get('feature_columns', [])
+                    logger.info(f"Forecast model loaded with {len(self._forecast_feature_cols)} features")
+                else:
+                    # Fallback: assume it's the model directly
+                    self._forecast_model = loaded_obj
+                    self._forecast_feature_cols = getattr(loaded_obj, 'feature_names_in_', [])
+                
+                self._forecast_model_loaded = True
+                return True
+            else:
+                logger.warning(f"Forecast model not found at {self._forecast_model_path}")
+                self._forecast_model_loaded = True
+                return False
+        except Exception as exc:
+            logger.error(f"Failed to load forecast model: {exc}")
+            self._forecast_model_loaded = True
+            return False
 
     def predict_all(self, db_client, period_start: Optional[datetime] = None, period_end: Optional[datetime] = None) -> list[EmployeeEfficiencyResult]:
         # Build one feature row per employee, run the classifier, and return ranked prediction results.
@@ -608,6 +641,196 @@ class EfficiencyPredictionService:
             forecast_score=forecast_score,
             source_weeks=len(week_scores),
         )
+
+    def get_employee_realtime_forecast(self, db_client, employee_id: str) -> Optional[float]:
+        """Generate real-time next-day productivity forecast using trained ML model.
+        
+        Returns the predicted productivity score (0-100) or None if unavailable.
+        """
+        if not self._load_forecast_model():
+            logger.warning(f"Forecast model not available for {employee_id}")
+            return None
+        
+        try:
+            emp_col = db_client.get_collection("employees")
+            if emp_col is None:
+                logger.warning(f"Employees collection not found")
+                return None
+            
+            emp = emp_col.find_one(
+                {"employee_id": employee_id},
+                {"_id": 0}
+            )
+            if not emp:
+                logger.warning(f"Employee {employee_id} not found")
+                return None
+            
+            # Get activity and task data for feature engineering
+            activity_col = db_client.get_collection("activity_logs")
+            task_col = db_client.get_collection("tasks")
+            
+            # Build basic feature row using latest available data
+            today = datetime.now(timezone.utc).date()
+            feature_data = self._build_forecast_features(
+                employee_id=employee_id,
+                activity_col=activity_col,
+                task_col=task_col,
+                target_date=today,
+            )
+            
+            if feature_data is None or feature_data.empty:
+                logger.warning(f"Could not build features for {employee_id}")
+                return None
+            
+            # Ensure feature columns match model expectations
+            expected_features = self._forecast_feature_cols if self._forecast_feature_cols else getattr(self._forecast_model, "feature_names_in_", None)
+            if expected_features is not None and len(expected_features) > 0:
+                # Reorder and filter features to match model expectations
+                missing_features = set(expected_features) - set(feature_data.columns)
+                extra_features = set(feature_data.columns) - set(expected_features)
+                
+                if missing_features:
+                    logger.warning(f"Missing features for {employee_id}: {missing_features}")
+                    # Fill missing features with 50 (baseline)
+                    for feat in missing_features:
+                        feature_data[feat] = 50.0
+                
+                if extra_features:
+                    logger.debug(f"Dropping extra features for {employee_id}: {extra_features}")
+                    feature_data = feature_data.drop(columns=list(extra_features))
+                
+                # Reorder to match model's expected order
+                feature_data = feature_data[list(expected_features)]
+            
+            # Use the trained model to predict
+            prediction = self._forecast_model.predict(feature_data)
+            forecast_score = float(np.clip(prediction[0], 0, 100))
+            logger.info(f"Real-time forecast for {employee_id}: {forecast_score:.2f}")
+            return forecast_score
+            
+        except Exception as exc:
+            logger.error(f"Real-time forecast generation failed for {employee_id}: {exc}", exc_info=True)
+            return None
+
+    def _build_forecast_features(self, employee_id: str, activity_col, task_col, target_date: date) -> Optional[pd.DataFrame]:
+        """Build feature row for real-time forecast model.
+        
+        Constructs the 41 features expected by the trained RandomForestRegressor.
+        Returns a DataFrame with a single row or None if insufficient data.
+        """
+        try:
+            feature_dict = {}
+            
+            # Fetch employee info for categorical fields
+            emp_dept = "Unknown"
+            emp_role = "Unknown"
+            
+            if activity_col is not None and hasattr(activity_col, 'database'):
+                try:
+                    emp_col = activity_col.database.get_collection("employees")
+                    if emp_col is not None:
+                        emp = emp_col.find_one({"employee_id": employee_id}, {"_id": 0})
+                        if emp:
+                            emp_dept = emp.get("department", "Unknown")
+                            emp_role = emp.get("role", "Unknown")
+                except Exception as e:
+                    logger.debug(f"Could not fetch employee info: {e}")
+            
+            # Add categorical features
+            feature_dict['employee_id'] = employee_id
+            feature_dict['department'] = emp_dept
+            feature_dict['role'] = emp_role
+            
+            # Get target date information
+            tomorrow = target_date + timedelta(days=1)
+            tomorrow_dow = tomorrow.weekday()
+            tomorrow_month = tomorrow.month
+            
+            feature_dict['target_day_of_week'] = tomorrow_dow
+            feature_dict['target_is_weekend'] = float(tomorrow_dow >= 5)
+            feature_dict['target_day_of_week_num'] = float(tomorrow_dow)
+            feature_dict['target_day_sin'] = np.sin(2 * np.pi * tomorrow_dow / 7)
+            feature_dict['target_day_cos'] = np.cos(2 * np.pi * tomorrow_dow / 7)
+            feature_dict['target_month_num'] = float(tomorrow_month)
+            feature_dict['target_month_sin'] = np.sin(2 * np.pi * tomorrow_month / 12)
+            feature_dict['target_month_cos'] = np.cos(2 * np.pi * tomorrow_month / 12)
+            
+            # Initialize all other features with baseline
+            base_features = [
+                'completion_rate_on_time', 'late_rate',
+                'productivity_score_lag_1', 'productivity_score_lag_14', 
+                'productivity_score_lag_2', 'productivity_score_lag_3', 'productivity_score_lag_7',
+                'tasks_assigned_today_lag_1', 'tasks_assigned_today_lag_14',
+                'tasks_assigned_today_lag_2', 'tasks_assigned_today_lag_3', 'tasks_assigned_today_lag_7',
+                'tasks_completed_today_lag_1', 'tasks_completed_today_lag_14',
+                'tasks_completed_today_lag_2', 'tasks_completed_today_lag_3', 'tasks_completed_today_lag_7',
+                'total_tasks_pending_lag_1', 'total_tasks_pending_lag_14',
+                'total_tasks_pending_lag_2', 'total_tasks_pending_lag_3', 'total_tasks_pending_lag_7',
+                'workload_score_lag_1', 'workload_score_lag_14',
+                'workload_score_lag_2', 'workload_score_lag_3', 'workload_score_lag_7',
+                'productivity_roll_mean_7', 'productivity_roll_std_7', 'productivity_roll_mean_14'
+            ]
+            
+            for feat in base_features:
+                feature_dict[feat] = 50.0
+            
+            # Fetch activity data
+            activity_data = []
+            if activity_col is not None:
+                last_30_days = target_date - timedelta(days=30)
+                activity_data = list(activity_col.find(
+                    {
+                        "employee_id": employee_id,
+                        "timestamp": {"$gte": datetime.combine(last_30_days, datetime.min.time(), tzinfo=timezone.utc)}
+                    },
+                    {"_id": 0}
+                ))
+            
+            # Fetch task data
+            task_data = []
+            if task_col is not None:
+                task_data = list(task_col.find(
+                    {"employee_id": employee_id},
+                    {"_id": 0}
+                ))
+            
+            # Compute task metrics
+            if task_data:
+                completed = sum(1 for t in task_data if t.get("status") == "completed")
+                pending = sum(1 for t in task_data if t.get("status") != "completed")
+                total = len(task_data)
+                
+                # Update task-based features
+                feature_dict['tasks_completed_today_lag_1'] = float(completed)
+                feature_dict['total_tasks_pending_lag_1'] = float(pending)
+                
+                if total > 0:
+                    feature_dict['completion_rate_on_time'] = completed / total
+                    feature_dict['late_rate'] = pending / total
+                    feature_dict['workload_score_lag_1'] = min(100.0, 30.0 + (pending / total * 70.0))
+                    
+                    # Use activity data to estimate productivity
+                    if activity_data:
+                        total_activity = len(activity_data)
+                        base_prod = min(100.0, 50.0 + (total_activity / 100.0))
+                    else:
+                        base_prod = 50.0 + (completed / total * 30.0)  # Estimate from tasks if no activity
+                    
+                    feature_dict['productivity_score_lag_1'] = base_prod
+                    feature_dict['productivity_score_lag_2'] = min(100.0, base_prod - 2.0)
+                    feature_dict['productivity_score_lag_3'] = min(100.0, base_prod - 4.0)
+                    feature_dict['productivity_score_lag_7'] = base_prod
+                    feature_dict['productivity_score_lag_14'] = min(100.0, base_prod - 1.0)
+                    feature_dict['productivity_roll_mean_7'] = base_prod
+                    feature_dict['productivity_roll_mean_14'] = min(100.0, base_prod - 1.0)
+            
+            # Create DataFrame
+            df = pd.DataFrame([feature_dict])
+            return df
+            
+        except Exception as exc:
+            logger.error(f"Failed to build forecast features for {employee_id}: {exc}", exc_info=True)
+            return None
 
     def _fallback_explanation(self, stats: dict, employee_id: str) -> list[str]:
         lines = ["A detailed LIME breakdown could not be generated in this run, so the system is using a plain-language fallback explanation."]
