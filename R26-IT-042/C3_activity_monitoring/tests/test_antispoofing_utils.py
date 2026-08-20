@@ -52,11 +52,9 @@ class TestAntispoofingUtils(unittest.TestCase):
             source="break_overrun:short_1",
         )
 
-        # Ensure the anti-spoofing result is persisted so the admin panel can display it later.
         self.assertTrue(ok)
         self.assertEqual(len(db.collection.docs), 1)
         doc = db.collection.docs[0]
-        # Validate the stored anti-spoofing check document structure and content.
         self.assertEqual(doc["user_id"], "EMP001")
         self.assertIn(doc["verdict"], {"REAL", "REAL_UNKNOWN", "NO_FACE"})
         self.assertEqual(doc["check_source"], "break_overrun:short_1")

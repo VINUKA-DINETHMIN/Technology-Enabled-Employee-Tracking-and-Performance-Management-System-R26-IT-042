@@ -22,7 +22,7 @@ Productivity model inference
     ↓
 ProductivityDocument → MongoDB::productivity_scores
     ↓
-LIME explanation
+SHAP / LIME explanation
     ↓
 WebSocket → dashboard
 ```

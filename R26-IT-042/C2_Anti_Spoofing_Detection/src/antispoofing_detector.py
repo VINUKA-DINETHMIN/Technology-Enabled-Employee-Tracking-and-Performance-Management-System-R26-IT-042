@@ -24,7 +24,6 @@ _MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 _MODEL_PATH = _MODELS_DIR / "best_anti_spoofing_model.keras"
 
 # Anti-spoofing thresholds
-# These values control how strictly the model decides real vs fake.
 _REAL_THRESHOLD = 0.5  # Score >= 0.5 = Real, < 0.5 = Fake
 _CONFIDENCE_THRESHOLD = 0.85  # Require >= 85% confidence for decision
 
@@ -82,7 +81,6 @@ class AntiSpoofingDetector:
             return True
 
         except ImportError:
-            # TensorFlow is optional here; the app can still run without anti-spoofing.
             logger.warning("TensorFlow not installed — anti-spoofing detection disabled.")
             return False
         except Exception as exc:
@@ -158,7 +156,6 @@ class AntiSpoofingDetector:
 
             # Interpret
             # score close to 0.0 = Real, score close to 1.0 = Fake
-            # Confidence is the stronger side of the score distribution.
             confidence = max(score, 1.0 - score)
             is_real = score < _REAL_THRESHOLD
 
@@ -215,8 +212,7 @@ class AntiSpoofingDetector:
             if not predictions:
                 return True, 0.0, "No frames captured"
 
-            # Use a temporal consensus across multiple frames to reduce false positives.
-            # If the majority of sampled frames look real, the final verdict is real.
+            # Average predictions
             avg_is_real = sum(p[0] for p in predictions) / len(predictions) >= 0.5
             avg_confidence = sum(p[1] for p in predictions) / len(predictions)
 
