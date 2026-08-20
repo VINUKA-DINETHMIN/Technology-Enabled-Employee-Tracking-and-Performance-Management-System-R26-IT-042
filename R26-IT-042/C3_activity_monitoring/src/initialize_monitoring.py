@@ -78,6 +78,7 @@ def start_monitoring(
         from C3_activity_monitoring.src.activity_logger import ActivityLogger
         from C3_activity_monitoring.src.screenshot_trigger import ScreenshotTrigger
         from C3_activity_monitoring.src.break_manager import BreakManager
+        from C3_activity_monitoring.src.macro_detector import MacroDetectorEngine
     except ImportError as exc:
         logger.error("C3 sub-component import failed: %s", exc)
         shutdown_event.wait()
@@ -87,6 +88,7 @@ def start_monitoring(
     keyboard = KeyboardTracker(window_sec=30.0)
     mouse = MouseTracker(window_sec=30.0)
     app = AppUsageMonitor(window_sec=30.0)
+    macro_detector = MacroDetectorEngine(keyboard=keyboard, mouse=mouse, window_sec=30.0)
 
     def _persist_alert(level: str, risk_score: float, factors: list[str], extra: Optional[dict] = None) -> None:
         """Persist alert documents so Admin Panel alert feed can display them."""
@@ -209,6 +211,7 @@ def start_monitoring(
         location_context=location_context,
         wifi_ssid_match=wifi_ssid_match,
         face_liveness_score=face_liveness_score,
+        macro_detector=macro_detector,
     )
 
     # Screenshot trigger
