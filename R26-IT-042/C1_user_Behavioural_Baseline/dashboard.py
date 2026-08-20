@@ -46,8 +46,9 @@ def safe_float(value, default=0.0):
         return float(value)
     except (ValueError, TypeError):
         return default
+    
 
-
+# functions for formatting durations and login times
 def format_duration(minutes):
     minutes = int(round(minutes))
     hours = minutes // 60
@@ -201,6 +202,7 @@ def load_records_from_mongo():
         client.close()
 
 
+# Load records from MongoDB if available, otherwise fall back to CSV file
 def load_records():
     records = load_records_from_mongo()
     if records:
@@ -230,6 +232,7 @@ def load_records():
     return records
 
 
+#Build behavioral baselines for each employee based on their activity records
 def build_employee_baselines(records):
     by_employee = defaultdict(list)
     for record in records:
@@ -423,6 +426,8 @@ class BehavioralBaselineApp(ctk.CTk):
 
         self._update_row_selection()
 
+
+    # When an employee is selected, show detailed baseline information in the right panel
     def show_employee_detail(self, employee_id: str):
         if employee_id not in self.baselines:
             return

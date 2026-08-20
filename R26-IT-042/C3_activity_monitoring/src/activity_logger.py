@@ -145,6 +145,27 @@ def _get_contributing_factors(fv: dict, risk_score: float) -> list[str]:
     ):
         factors.append("low_mouse_movement")
 
+    # ── Macro/Synthetic Input Detection Factors (NEW) ──────────────────
+    macro_risk = _safe_float(fv.get("macro_risk_score", 0.0), 0.0)
+    if macro_risk > 0.7:
+        factors.append("macro_detected_high_risk")
+    elif macro_risk > 0.5:
+        factors.append("macro_detected_moderate_risk")
+    
+    # Individual macro indicators
+    if _safe_float(fv.get("coefficient_of_variation_iki", 0.5), 0.5) > 0.8:
+        factors.append("suspicious_keystroke_regularity")
+    if _safe_float(fv.get("keystroke_periodicity_score", 0.0), 0.0) > 0.6:
+        factors.append("periodic_keystroke_pattern")
+    if _safe_float(fv.get("sequence_repetition_score", 0.0), 0.0) > 0.5:
+        factors.append("repeating_keystroke_sequences")
+    if _safe_float(fv.get("dwell_time_consistency", 0.5), 0.5) > 0.8:
+        factors.append("unnaturally_uniform_dwell_time")
+    if _safe_float(fv.get("keystroke_mouse_sync_score", 0.5), 0.5) > 0.7:
+        factors.append("keyboard_mouse_desynchronization")
+    if _safe_float(fv.get("keystroke_timing_jitter", 0.5), 0.5) > 0.7:
+        factors.append("machine_perfect_keystroke_timing")
+
     if risk_score >= _HARD_WARN:
         factors.append("high_composite_risk")
     return factors

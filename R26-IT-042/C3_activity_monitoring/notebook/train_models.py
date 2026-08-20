@@ -4,13 +4,10 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MODELS_DIR = PROJECT_ROOT / "models"
-
-# Try multiple candidate data directories for the current Windows project layout.
+# Try multiple candidate data directories (normal + editor-style with colon)
 CANDIDATE_DATA_DIRS = [
-    str(PROJECT_ROOT / "data"),
-    str(Path.cwd() / "data"),
+    "/Users/vinukadinethmin/Desktop/C3_activity_monitoring/data",
+    "/Users/vinukadinethmin/Desktop/C3_activity_monitoring:/data",
 ]
 
 DATA_DIR = None
@@ -195,14 +192,14 @@ if_model.fit(X_scaled)
 _log('Training complete!')
 
 # Save models
-_log(f'Saving models to {MODELS_DIR}...')
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
-with open(MODELS_DIR / "if_model.pkl", "wb") as f:
+_log('Saving models to ../models/...')
+os.makedirs("../models", exist_ok=True)
+with open("../models/if_model.pkl", "wb") as f:
     pickle.dump(if_model, f)
-with open(MODELS_DIR / "if_scaler.pkl", "wb") as f:
+with open("../models/if_scaler.pkl", "wb") as f:
     pickle.dump(if_scaler, f)
 
-_log(f'Models saved to {MODELS_DIR}')
+_log('Models saved to ../models/')
 
 # %% [markdown]
 # ## Cell 7 — Evaluate Isolation Forest
@@ -277,9 +274,9 @@ sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[2],
 axes[2].set_title('Confusion Matrix — IF')
 
 plt.tight_layout()
-plt.savefig(MODELS_DIR / 'if_evaluation.png', dpi=150, bbox_inches='tight')
+plt.savefig('../models/if_evaluation.png', dpi=150, bbox_inches='tight')
 plt.show()
-print(f"Chart saved to {MODELS_DIR / 'if_evaluation.png'}")
+print("Chart saved to ../models/if_evaluation.png")
 
 # %% [markdown]
 # ## Cell 9 — Train Shallow Autoencoder (SECONDARY MODEL)
@@ -325,14 +322,14 @@ print(f"Std training error   : {np.std(train_errors):.6f}")
 print(f"Anomaly threshold    : {ae_threshold:.6f}  (mean + 2*std)")
 
 # Save model, scaler, and threshold
-with open(MODELS_DIR / "ae_model.pkl", "wb") as f:
+with open("../models/ae_model.pkl", "wb") as f:
     pickle.dump(ae_model, f)
-with open(MODELS_DIR / "ae_scaler.pkl", "wb") as f:
+with open("../models/ae_scaler.pkl", "wb") as f:
     pickle.dump(ae_scaler, f)
-with open(MODELS_DIR / "ae_threshold.pkl", "wb") as f:
+with open("../models/ae_threshold.pkl", "wb") as f:
     pickle.dump(ae_threshold, f)
 
-print(f"\nAll AE files saved to {MODELS_DIR}")
+print("\nAll AE files saved to ../models/")
 
 # %% [markdown]
 # ## Cell 10 — Evaluate Autoencoder
@@ -405,7 +402,7 @@ sns.heatmap(cm2, annot=True, fmt='d', cmap='Oranges', ax=axes[2],
 axes[2].set_title('Confusion Matrix — AE')
 
 plt.tight_layout()
-plt.savefig(MODELS_DIR / 'ae_evaluation.png', dpi=150, bbox_inches='tight')
+plt.savefig('../models/ae_evaluation.png', dpi=150, bbox_inches='tight')
 plt.show()
 
 # %% [markdown]
@@ -452,21 +449,21 @@ print("  FINAL SUMMARY — All Models Trained & Saved")
 print("=" * 55)
 
 model_files = [
-    MODELS_DIR / 'if_model.pkl',
-    MODELS_DIR / 'if_scaler.pkl',
-    MODELS_DIR / 'ae_model.pkl',
-    MODELS_DIR / 'ae_scaler.pkl',
-    MODELS_DIR / 'ae_threshold.pkl',
+    '../models/if_model.pkl',
+    '../models/if_scaler.pkl',
+    '../models/ae_model.pkl',
+    '../models/ae_scaler.pkl',
+    '../models/ae_threshold.pkl',
 ]
 
 print("\nSaved model files:")
 for path in model_files:
-    exists = path.exists()
-    size   = path.stat().st_size if exists else 0
-    print(f"  {'OK' if exists else 'MISSING':<8} {str(path):<40} {size/1024:.1f} KB")
+    exists = os.path.exists(path)
+    size   = os.path.getsize(path) if exists else 0
+    print(f"  {'OK' if exists else 'MISSING':<8} {path:<40} {size/1024:.1f} KB")
 
 print(f"\nIsolation Forest  → AUC={auc:.4f}  TPR={tpr:.4f}  FPR={fpr:.4f}")
 print(f"Autoencoder       → AUC={auc2:.4f}  TPR={tpr2:.4f}  FPR={fpr2:.4f}")
 print(f"Composite Score   → AUC={auc_c:.4f}")
-print(f"\nAll files ready for {MODELS_DIR}")
+print(f"\nAll files ready for C3_activity_monitoring/models/")
 print("Copy these .pkl files into your project's models/ folder.")

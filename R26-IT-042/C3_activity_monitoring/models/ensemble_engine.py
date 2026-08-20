@@ -27,14 +27,6 @@ def _p(p: str) -> Path:
     return Path(p)
 
 
-def _first_existing(base: Path, *names: str) -> Path:
-    for name in names:
-        candidate = base.joinpath(name)
-        if candidate.exists():
-            return candidate
-    return base.joinpath(names[0])
-
-
 def load_engine(models_dir: Optional[str] = None) -> Dict[str, Any]:
     """Load models and config from models_dir (defaults to this file's parent).
 
@@ -48,13 +40,13 @@ def load_engine(models_dir: Optional[str] = None) -> Dict[str, Any]:
     def _lp(name):
         return base.joinpath(name)
 
-    # required files, with backward-compatible fallbacks for the live app names
-    if_path = _first_existing(base, 'if_model.pkl', 'user_behavioral_model.pkl')
-    ae_path = _first_existing(base, 'ae_model.pkl')
+    # required files
+    if_path = _lp('if_model.pkl')
+    ae_path = _lp('ae_model.pkl')
     cfg_path = _lp('ensemble_config.json')
 
     if not if_path.exists() or not ae_path.exists():
-        raise FileNotFoundError(f"Missing model files in {base}. Expected one of: if_model.pkl/user_behavioral_model.pkl and ae_model.pkl")
+        raise FileNotFoundError(f"Missing model files in {base}. Expected: if_model.pkl and ae_model.pkl")
 
     with open(if_path, 'rb') as f:
         if_model = pickle.load(f)
@@ -62,7 +54,7 @@ def load_engine(models_dir: Optional[str] = None) -> Dict[str, Any]:
         ae_model = pickle.load(f)
 
     scaler = None
-    scaler_path = _first_existing(base, 'if_scaler.pkl', 'feature_scaler.pkl')
+    scaler_path = _lp('if_scaler.pkl')
     if scaler_path.exists():
         try:
             with open(scaler_path, 'rb') as f:
@@ -93,8 +85,8 @@ def load_engine(models_dir: Optional[str] = None) -> Dict[str, Any]:
         'ae_model': ae_model,
         'scaler': scaler,
         'config': config,
-        'models_dir': str(base),
-        'meta_clf': meta_clf,
+    'models_dir': str(base),
+    'meta_clf': meta_clf
     }
 
 

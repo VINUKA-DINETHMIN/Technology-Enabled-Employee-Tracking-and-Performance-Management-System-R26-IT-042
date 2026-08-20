@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 import threading
 import time
 
 import joblib
+import numpy as np
 import pandas as pd
+
+try:
+    from lime.lime_tabular import LimeTabularExplainer
+except Exception:
+    LimeTabularExplainer = None
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +26,7 @@ class EmployeeEfficiencyResult:
     full_name: str
     predicted_label: str
     confidence: float
+    efficiency_score: float
     productivity_score_input: float
     workload_score: float
     total_tasks_assigned: int
@@ -34,6 +41,7 @@ class EmployeeProductivityReport:
     full_name: str
     predicted_label: str
     confidence: float
+    efficiency_score: float
     productivity_score: float
     workload_score: float
     total_tasks_assigned: int
@@ -47,6 +55,19 @@ class EmployeeProductivityReport:
     insights: list[str]
 
 
+@dataclass
+class EmployeeWeeklyForecast:
+    employee_id: str
+    full_name: str
+    available: bool
+    message: str
+    history_weeks: list[str] = field(default_factory=list)
+    history_scores: list[float] = field(default_factory=list)
+    forecast_week: str = ""
+    forecast_score: Optional[float] = None
+    source_weeks: int = 0
+
+
 class EfficiencyPredictionService:
     """Read-only C4 prediction service built on top of existing MongoDB data."""
 
@@ -58,11 +79,16 @@ class EfficiencyPredictionService:
         base = Path(__file__).resolve().parent
         self._model_path = model_path or (base / "productivity_classifier.joblib")
         self._label_encoder_path = label_encoder_path or (base / "label_encoder.joblib")
+        self._forecast_model_path = base / "employee_productivity_forecast_model.joblib"
         self._model = None
         self._label_encoder = None
         self._feature_names: list[str] = []
+        self._forecast_model = None
+        self._forecast_feature_cols: list[str] = []
+        self._forecast_model_loaded = False
 
     def load(self) -> None:
+        # Load the trained model and label encoder, then capture the model's expected feature order.
         self._model = joblib.load(self._model_path)
         self._label_encoder = joblib.load(self._label_encoder_path)
         names = getattr(self._model, "feature_names_in_", None)
@@ -70,7 +96,37 @@ class EfficiencyPredictionService:
             raise ValueError("Model does not expose feature_names_in_.")
         self._feature_names = [str(n) for n in names]
 
+    def _load_forecast_model(self) -> bool:
+        """Load the real-time forecasting model if available."""
+        if self._forecast_model_loaded:
+            return self._forecast_model is not None
+        
+        try:
+            if self._forecast_model_path.exists():
+                loaded_obj = joblib.load(self._forecast_model_path)
+                # The joblib file is a dict containing the model and metadata
+                if isinstance(loaded_obj, dict):
+                    self._forecast_model = loaded_obj.get('model')
+                    self._forecast_feature_cols = loaded_obj.get('feature_columns', [])
+                    logger.info(f"Forecast model loaded with {len(self._forecast_feature_cols)} features")
+                else:
+                    # Fallback: assume it's the model directly
+                    self._forecast_model = loaded_obj
+                    self._forecast_feature_cols = getattr(loaded_obj, 'feature_names_in_', [])
+                
+                self._forecast_model_loaded = True
+                return True
+            else:
+                logger.warning(f"Forecast model not found at {self._forecast_model_path}")
+                self._forecast_model_loaded = True
+                return False
+        except Exception as exc:
+            logger.error(f"Failed to load forecast model: {exc}")
+            self._forecast_model_loaded = True
+            return False
+
     def predict_all(self, db_client, period_start: Optional[datetime] = None, period_end: Optional[datetime] = None) -> list[EmployeeEfficiencyResult]:
+        # Build one feature row per employee, run the classifier, and return ranked prediction results.
         if self._model is None or self._label_encoder is None:
             self.load()
 
@@ -167,6 +223,11 @@ class EfficiencyPredictionService:
                     full_name=stats["full_name"],
                     predicted_label=str(label),
                     confidence=confidence,
+                    efficiency_score=self._calculate_efficiency_score(
+                        float(stats["workload_score"]),
+                        str(label),
+                        confidence,
+                    ),
                     productivity_score_input=float(stats["productivity_score_input"]),
                     workload_score=float(stats["workload_score"]),
                     total_tasks_assigned=int(stats["total_tasks_assigned"]),
@@ -187,6 +248,7 @@ class EfficiencyPredictionService:
         period_start: Optional[datetime] = None,
         period_end: Optional[datetime] = None,
     ) -> Optional[EmployeeProductivityReport]:
+        # Convert the raw prediction into a readable employee-level productivity summary.
         target_id = self._normalize_employee_id(employee_id)
         if not target_id:
             return None
@@ -252,6 +314,7 @@ class EfficiencyPredictionService:
             full_name=target.full_name,
             predicted_label=target.predicted_label,
             confidence=target.confidence,
+            efficiency_score=target.efficiency_score,
             productivity_score=target.productivity_score_input,
             workload_score=target.workload_score,
             total_tasks_assigned=assigned,
@@ -265,7 +328,556 @@ class EfficiencyPredictionService:
             insights=insights,
         )
 
+    def get_employee_lime_explanation(
+        self,
+        db_client,
+        employee_id: str,
+        period_start: Optional[datetime] = None,
+        period_end: Optional[datetime] = None,
+        max_features: int = 5,
+    ) -> list[str]:
+        # Build a local LIME explanation from the current employee slice without changing the model or stored data.
+        target_id = self._normalize_employee_id(employee_id)
+        if not target_id:
+            return ["No employee was selected for the explanation."]
+
+        if self._model is None or self._label_encoder is None:
+            self.load()
+
+        if db_client is None or not getattr(db_client, "is_connected", False):
+            return ["No database connection is available for the explanation."]
+
+        emp_col = db_client.get_collection("employees")
+        task_col = db_client.get_collection("tasks")
+        activity_col = db_client.get_collection("activity_logs")
+
+        if emp_col is None:
+            return ["No employee data is available for explanation."]
+
+        employees = list(emp_col.find({}, {"_id": 0}))
+        if not employees:
+            return ["No employee records were found for explanation."]
+
+        employee_lookup: dict[str, dict] = {}
+        for emp in employees:
+            employee_id_value = str(emp.get("employee_id") or "").strip()
+            if not employee_id_value:
+                continue
+            employee_lookup.setdefault(self._normalize_employee_id(employee_id_value), emp)
+
+        tasks_by_employee: dict[str, list[dict]] = {key: [] for key in employee_lookup}
+        if task_col is not None:
+            for task in task_col.find({}, {"_id": 0}):
+                raw_employee_id = str(task.get("employee_id") or "").strip()
+                if not raw_employee_id:
+                    continue
+                normalized_employee_id = self._normalize_employee_id(raw_employee_id)
+                if normalized_employee_id not in employee_lookup:
+                    continue
+                tasks_by_employee.setdefault(normalized_employee_id, []).append(task)
+
+        activity_by_employee: dict[str, list[dict]] = {key: [] for key in employee_lookup}
+        if activity_col is not None:
+            for doc in activity_col.find({}, {"_id": 0, "productivity_score": 1, "timestamp": 1, "user_id": 1}):
+                raw_user_id = str(doc.get("user_id") or "").strip()
+                if not raw_user_id:
+                    continue
+                normalized_user_id = self._normalize_employee_id(raw_user_id)
+                if normalized_user_id not in employee_lookup:
+                    continue
+                activity_by_employee.setdefault(normalized_user_id, []).append(doc)
+
+        rows: list[dict] = []
+        meta: list[dict] = []
+        target_index = None
+
+        for idx, (employee_key, emp) in enumerate(employee_lookup.items()):
+            employee_id_value = str(emp.get("employee_id") or "").strip()
+            if not employee_id_value:
+                continue
+
+            tasks = self._filter_tasks_for_period(tasks_by_employee.get(employee_key, []), period_start, period_end)
+            activity_logs = self._filter_activity_for_period(activity_by_employee.get(employee_key, []), period_start, period_end)
+
+            row, stats = self._build_feature_row(emp, tasks, activity_logs)
+            rows.append(row)
+            meta.append(stats)
+
+            if self._normalize_employee_id(employee_id_value) == target_id:
+                target_index = len(rows) - 1
+
+        if target_index is None or not rows:
+            return ["No explanation could be generated for the selected employee."]
+
+        frame = pd.DataFrame(rows, columns=self._feature_names)
+        if len(frame) < 2:
+            return ["Not enough employee data is available yet to generate a reliable LIME explanation."]
+
+        if LimeTabularExplainer is None:
+            return self._fallback_explanation(meta[target_index], target_id)
+
+        preprocessor = getattr(self._model, "named_steps", {}).get("preprocessor")
+        model = getattr(self._model, "named_steps", {}).get("model")
+        if preprocessor is None or model is None:
+            return ["The model structure does not support LIME explanation in the current run."]
+
+        transformed = preprocessor.transform(frame)
+        if hasattr(transformed, "toarray"):
+            transformed = transformed.toarray()
+        transformed = transformed.astype(float, copy=False)
+
+        feature_names = [str(name) for name in preprocessor.get_feature_names_out()]
+        class_names = [str(name) for name in getattr(self._label_encoder, "classes_", [])]
+
+        explainer = LimeTabularExplainer(
+            training_data=transformed,
+            feature_names=feature_names,
+            class_names=class_names,
+            mode="classification",
+            discretize_continuous=True,
+        )
+
+        target_label = str(meta[target_index]["employee_id"])
+        target_row = transformed[target_index]
+        prediction = str(self._label_encoder.inverse_transform(self._model.predict(frame))[target_index])
+        label_index = int(self._label_encoder.transform([prediction])[0])
+
+        friendly_lines: list[str] = []
+
+        explanation = explainer.explain_instance(
+            data_row=target_row,
+            predict_fn=model.predict_proba,
+            num_features=max(1, min(max_features, len(feature_names))),
+            top_labels=1,
+        )
+
+        raw_factors = explanation.as_list(label=label_index) or explanation.as_list()
+        for factor, weight in raw_factors[:max_features]:
+            factor_line = self._format_lime_factor(factor, float(weight), prediction)
+            if factor_line:
+                friendly_lines.append(factor_line)
+
+        if not friendly_lines:
+            friendly_lines.append(f"The model did not produce a detailed factor breakdown for {target_label}.")
+
+        return friendly_lines
+
+    def get_employee_weekly_forecast(
+        self,
+        db_client,
+        employee_id: str,
+        period_end: Optional[datetime] = None,
+        lookback_weeks: int = 8,
+        min_weeks: int = 4,
+    ) -> EmployeeWeeklyForecast:
+        target_id = self._normalize_employee_id(employee_id)
+        if not target_id:
+            return EmployeeWeeklyForecast(
+                employee_id="",
+                full_name="",
+                available=False,
+                message="No employee was selected for the forecast.",
+            )
+
+        if self._model is None or self._label_encoder is None:
+            self.load()
+
+        if db_client is None or not getattr(db_client, "is_connected", False):
+            return EmployeeWeeklyForecast(
+                employee_id=employee_id,
+                full_name=employee_id,
+                available=False,
+                message="No database connection is available for the forecast.",
+            )
+
+        emp_col = db_client.get_collection("employees")
+        task_col = db_client.get_collection("tasks")
+        activity_col = db_client.get_collection("activity_logs")
+
+        if emp_col is None or task_col is None or activity_col is None:
+            return EmployeeWeeklyForecast(
+                employee_id=employee_id,
+                full_name=employee_id,
+                available=False,
+                message="The forecast cannot be generated because one or more source collections are unavailable.",
+            )
+
+        employees = list(emp_col.find({}, {"_id": 0}))
+        if not employees:
+            return EmployeeWeeklyForecast(
+                employee_id=employee_id,
+                full_name=employee_id,
+                available=False,
+                message="No employee records are available for forecasting.",
+            )
+
+        employee_lookup: dict[str, dict] = {}
+        for emp in employees:
+            employee_id_value = str(emp.get("employee_id") or "").strip()
+            if not employee_id_value:
+                continue
+            employee_lookup.setdefault(self._normalize_employee_id(employee_id_value), emp)
+
+        emp = employee_lookup.get(target_id)
+        if emp is None:
+            return EmployeeWeeklyForecast(
+                employee_id=employee_id,
+                full_name=employee_id,
+                available=False,
+                message="No employee record was found for the selected employee.",
+            )
+
+        employee_name = str(emp.get("full_name") or emp.get("employee_id") or employee_id)
+
+        tasks = [
+            task for task in task_col.find({}, {"_id": 0})
+            if self._normalize_employee_id(str(task.get("employee_id") or "")) == target_id
+        ]
+        activity_logs = [
+            doc for doc in activity_col.find({}, {"_id": 0, "productivity_score": 1, "timestamp": 1, "user_id": 1})
+            if self._normalize_employee_id(str(doc.get("user_id") or "")) == target_id
+        ]
+
+        anchor_end = period_end or datetime.now(timezone.utc)
+        if anchor_end.tzinfo is None:
+            anchor_end = anchor_end.replace(tzinfo=timezone.utc)
+        else:
+            anchor_end = anchor_end.astimezone(timezone.utc)
+
+        history_start = anchor_end - timedelta(days=7 * max(lookback_weeks, min_weeks))
+        weekly_buckets: dict[date, dict[str, list[dict]]] = {}
+
+        for task in tasks:
+            ref_dt = self._task_reference_dt(task)
+            if ref_dt is None or ref_dt < history_start or ref_dt > anchor_end:
+                continue
+            week_start = (ref_dt - timedelta(days=ref_dt.weekday())).date()
+            bucket = weekly_buckets.setdefault(week_start, {"tasks": [], "activity": []})
+            bucket["tasks"].append(task)
+
+        for doc in activity_logs:
+            ts = self._parse_dt(doc.get("timestamp"))
+            if ts is None or ts < history_start or ts > anchor_end:
+                continue
+            week_start = (ts - timedelta(days=ts.weekday())).date()
+            bucket = weekly_buckets.setdefault(week_start, {"tasks": [], "activity": []})
+            bucket["activity"].append(doc)
+
+        if len(weekly_buckets) < min_weeks:
+            return EmployeeWeeklyForecast(
+                employee_id=str(emp.get("employee_id") or employee_id),
+                full_name=employee_name,
+                available=False,
+                message=(
+                    "Current data is not sufficient for a reliable next-week forecast. "
+                    f"At least {min_weeks} weekly history points are needed."
+                ),
+                source_weeks=len(weekly_buckets),
+            )
+
+        weekly_points: list[tuple[date, float]] = []
+        for week_start in sorted(weekly_buckets):
+            bucket = weekly_buckets[week_start]
+            row, stats = self._build_feature_row(emp, bucket["tasks"], bucket["activity"])
+            frame = pd.DataFrame([row], columns=self._feature_names)
+
+            pred_label = str(self._label_encoder.inverse_transform(self._model.predict(frame))[0])
+            confidence = float(self._model.predict_proba(frame)[0].max())
+            efficiency_score = self._calculate_efficiency_score(
+                float(stats["workload_score"]),
+                pred_label,
+                confidence,
+            )
+            weekly_points.append((week_start, efficiency_score))
+
+        if len(weekly_points) < min_weeks:
+            return EmployeeWeeklyForecast(
+                employee_id=str(emp.get("employee_id") or employee_id),
+                full_name=employee_name,
+                available=False,
+                message=(
+                    "Current data is not sufficient for a reliable next-week forecast. "
+                    f"At least {min_weeks} weekly history points are needed."
+                ),
+                source_weeks=len(weekly_points),
+            )
+
+        weekly_points = weekly_points[-lookback_weeks:]
+        week_labels = [week_start.strftime("%b %d") for week_start, _ in weekly_points]
+        week_scores = [float(score) for _, score in weekly_points]
+
+        x = np.arange(len(week_scores), dtype=float)
+        y = np.asarray(week_scores, dtype=float)
+        if len(week_scores) >= 2:
+            slope, intercept = np.polyfit(x, y, deg=1)
+            forecast_raw = float(slope * len(week_scores) + intercept)
+            fitted = slope * x + intercept
+            rmse = float(np.sqrt(np.mean((y - fitted) ** 2))) if len(week_scores) else 0.0
+            stability = max(0.0, min(1.0, 1.0 - (rmse / 30.0)))
+            trend = "improving" if slope > 0.5 else "softening" if slope < -0.5 else "stable"
+        else:
+            forecast_raw = float(week_scores[-1])
+            stability = 0.5
+            trend = "stable"
+
+        forecast_score = float(max(0.0, min(100.0, round(forecast_raw, 1))))
+        next_week_start = weekly_points[-1][0] + timedelta(days=7)
+        forecast_week = next_week_start.strftime("%b %d")
+        message = (
+            f"Based on the last {len(week_scores)} weekly data points, the employee's forecast for next week is "
+            f"{forecast_score:.1f}/100 and the recent trend appears {trend}."
+        )
+        if stability < 0.45:
+            message += " The pattern is somewhat volatile, so treat the forecast as directional rather than exact."
+
+        return EmployeeWeeklyForecast(
+            employee_id=str(emp.get("employee_id") or employee_id),
+            full_name=employee_name,
+            available=True,
+            message=message,
+            history_weeks=week_labels,
+            history_scores=week_scores,
+            forecast_week=forecast_week,
+            forecast_score=forecast_score,
+            source_weeks=len(week_scores),
+        )
+
+    def get_employee_realtime_forecast(self, db_client, employee_id: str) -> Optional[float]:
+        """Generate real-time next-day productivity forecast using trained ML model.
+        
+        Returns the predicted productivity score (0-100) or None if unavailable.
+        """
+        if not self._load_forecast_model():
+            logger.warning(f"Forecast model not available for {employee_id}")
+            return None
+        
+        try:
+            emp_col = db_client.get_collection("employees")
+            if emp_col is None:
+                logger.warning(f"Employees collection not found")
+                return None
+            
+            emp = emp_col.find_one(
+                {"employee_id": employee_id},
+                {"_id": 0}
+            )
+            if not emp:
+                logger.warning(f"Employee {employee_id} not found")
+                return None
+            
+            # Get activity and task data for feature engineering
+            activity_col = db_client.get_collection("activity_logs")
+            task_col = db_client.get_collection("tasks")
+            
+            # Build basic feature row using latest available data
+            today = datetime.now(timezone.utc).date()
+            feature_data = self._build_forecast_features(
+                employee_id=employee_id,
+                activity_col=activity_col,
+                task_col=task_col,
+                target_date=today,
+            )
+            
+            if feature_data is None or feature_data.empty:
+                logger.warning(f"Could not build features for {employee_id}")
+                return None
+            
+            # Ensure feature columns match model expectations
+            expected_features = self._forecast_feature_cols if self._forecast_feature_cols else getattr(self._forecast_model, "feature_names_in_", None)
+            if expected_features is not None and len(expected_features) > 0:
+                # Reorder and filter features to match model expectations
+                missing_features = set(expected_features) - set(feature_data.columns)
+                extra_features = set(feature_data.columns) - set(expected_features)
+                
+                if missing_features:
+                    logger.warning(f"Missing features for {employee_id}: {missing_features}")
+                    # Fill missing features with 50 (baseline)
+                    for feat in missing_features:
+                        feature_data[feat] = 50.0
+                
+                if extra_features:
+                    logger.debug(f"Dropping extra features for {employee_id}: {extra_features}")
+                    feature_data = feature_data.drop(columns=list(extra_features))
+                
+                # Reorder to match model's expected order
+                feature_data = feature_data[list(expected_features)]
+            
+            # Use the trained model to predict
+            prediction = self._forecast_model.predict(feature_data)
+            forecast_score = float(np.clip(prediction[0], 0, 100))
+            logger.info(f"Real-time forecast for {employee_id}: {forecast_score:.2f}")
+            return forecast_score
+            
+        except Exception as exc:
+            logger.error(f"Real-time forecast generation failed for {employee_id}: {exc}", exc_info=True)
+            return None
+
+    def _build_forecast_features(self, employee_id: str, activity_col, task_col, target_date: date) -> Optional[pd.DataFrame]:
+        """Build feature row for real-time forecast model.
+        
+        Constructs the 41 features expected by the trained RandomForestRegressor.
+        Returns a DataFrame with a single row or None if insufficient data.
+        """
+        try:
+            feature_dict = {}
+            
+            # Fetch employee info for categorical fields
+            emp_dept = "Unknown"
+            emp_role = "Unknown"
+            
+            if activity_col is not None and hasattr(activity_col, 'database'):
+                try:
+                    emp_col = activity_col.database.get_collection("employees")
+                    if emp_col is not None:
+                        emp = emp_col.find_one({"employee_id": employee_id}, {"_id": 0})
+                        if emp:
+                            emp_dept = emp.get("department", "Unknown")
+                            emp_role = emp.get("role", "Unknown")
+                except Exception as e:
+                    logger.debug(f"Could not fetch employee info: {e}")
+            
+            # Add categorical features
+            feature_dict['employee_id'] = employee_id
+            feature_dict['department'] = emp_dept
+            feature_dict['role'] = emp_role
+            
+            # Get target date information
+            tomorrow = target_date + timedelta(days=1)
+            tomorrow_dow = tomorrow.weekday()
+            tomorrow_month = tomorrow.month
+            
+            feature_dict['target_day_of_week'] = tomorrow_dow
+            feature_dict['target_is_weekend'] = float(tomorrow_dow >= 5)
+            feature_dict['target_day_of_week_num'] = float(tomorrow_dow)
+            feature_dict['target_day_sin'] = np.sin(2 * np.pi * tomorrow_dow / 7)
+            feature_dict['target_day_cos'] = np.cos(2 * np.pi * tomorrow_dow / 7)
+            feature_dict['target_month_num'] = float(tomorrow_month)
+            feature_dict['target_month_sin'] = np.sin(2 * np.pi * tomorrow_month / 12)
+            feature_dict['target_month_cos'] = np.cos(2 * np.pi * tomorrow_month / 12)
+            
+            # Initialize all other features with baseline
+            base_features = [
+                'completion_rate_on_time', 'late_rate',
+                'productivity_score_lag_1', 'productivity_score_lag_14', 
+                'productivity_score_lag_2', 'productivity_score_lag_3', 'productivity_score_lag_7',
+                'tasks_assigned_today_lag_1', 'tasks_assigned_today_lag_14',
+                'tasks_assigned_today_lag_2', 'tasks_assigned_today_lag_3', 'tasks_assigned_today_lag_7',
+                'tasks_completed_today_lag_1', 'tasks_completed_today_lag_14',
+                'tasks_completed_today_lag_2', 'tasks_completed_today_lag_3', 'tasks_completed_today_lag_7',
+                'total_tasks_pending_lag_1', 'total_tasks_pending_lag_14',
+                'total_tasks_pending_lag_2', 'total_tasks_pending_lag_3', 'total_tasks_pending_lag_7',
+                'workload_score_lag_1', 'workload_score_lag_14',
+                'workload_score_lag_2', 'workload_score_lag_3', 'workload_score_lag_7',
+                'productivity_roll_mean_7', 'productivity_roll_std_7', 'productivity_roll_mean_14'
+            ]
+            
+            for feat in base_features:
+                feature_dict[feat] = 50.0
+            
+            # Fetch activity data
+            activity_data = []
+            if activity_col is not None:
+                last_30_days = target_date - timedelta(days=30)
+                activity_data = list(activity_col.find(
+                    {
+                        "employee_id": employee_id,
+                        "timestamp": {"$gte": datetime.combine(last_30_days, datetime.min.time(), tzinfo=timezone.utc)}
+                    },
+                    {"_id": 0}
+                ))
+            
+            # Fetch task data
+            task_data = []
+            if task_col is not None:
+                task_data = list(task_col.find(
+                    {"employee_id": employee_id},
+                    {"_id": 0}
+                ))
+            
+            # Compute task metrics
+            if task_data:
+                completed = sum(1 for t in task_data if t.get("status") == "completed")
+                pending = sum(1 for t in task_data if t.get("status") != "completed")
+                total = len(task_data)
+                
+                # Update task-based features
+                feature_dict['tasks_completed_today_lag_1'] = float(completed)
+                feature_dict['total_tasks_pending_lag_1'] = float(pending)
+                
+                if total > 0:
+                    feature_dict['completion_rate_on_time'] = completed / total
+                    feature_dict['late_rate'] = pending / total
+                    feature_dict['workload_score_lag_1'] = min(100.0, 30.0 + (pending / total * 70.0))
+                    
+                    # Use activity data to estimate productivity
+                    if activity_data:
+                        total_activity = len(activity_data)
+                        base_prod = min(100.0, 50.0 + (total_activity / 100.0))
+                    else:
+                        base_prod = 50.0 + (completed / total * 30.0)  # Estimate from tasks if no activity
+                    
+                    feature_dict['productivity_score_lag_1'] = base_prod
+                    feature_dict['productivity_score_lag_2'] = min(100.0, base_prod - 2.0)
+                    feature_dict['productivity_score_lag_3'] = min(100.0, base_prod - 4.0)
+                    feature_dict['productivity_score_lag_7'] = base_prod
+                    feature_dict['productivity_score_lag_14'] = min(100.0, base_prod - 1.0)
+                    feature_dict['productivity_roll_mean_7'] = base_prod
+                    feature_dict['productivity_roll_mean_14'] = min(100.0, base_prod - 1.0)
+            
+            # Create DataFrame
+            df = pd.DataFrame([feature_dict])
+            return df
+            
+        except Exception as exc:
+            logger.error(f"Failed to build forecast features for {employee_id}: {exc}", exc_info=True)
+            return None
+
+    def _fallback_explanation(self, stats: dict, employee_id: str) -> list[str]:
+        lines = ["A detailed LIME breakdown could not be generated in this run, so the system is using a plain-language fallback explanation."]
+
+        assigned = int(stats.get("total_tasks_assigned", 0) or 0)
+        pending = int(stats.get("total_tasks_pending", 0) or 0)
+        on_time = int(stats.get("total_tasks_completed_on_time", 0) or 0)
+        late = int(stats.get("total_tasks_completed_late", 0) or 0)
+        completed = on_time + late
+        workload = float(stats.get("workload_score", 0.0) or 0.0)
+        prod_input = float(stats.get("productivity_score_input", 0.0) or 0.0)
+
+        if assigned == 0:
+            lines.append("No tasks were assigned in this period, so the score is based mostly on activity signals.")
+        else:
+            backlog_ratio = pending / assigned
+            completion_ratio = completed / assigned
+            if backlog_ratio >= 0.5:
+                lines.append("A large share of tasks is still pending, which lowers the efficiency score.")
+            elif backlog_ratio <= 0.2:
+                lines.append("Most assigned tasks are not pending, which supports a stronger efficiency score.")
+
+            if completion_ratio >= 0.8:
+                lines.append("Task completion is strong for this employee during the selected period.")
+            elif completion_ratio < 0.5:
+                lines.append("Only a small portion of assigned tasks is completed, which reduces the score.")
+
+            if completed > 0 and late > on_time:
+                lines.append("More tasks were completed late than on time, which pulls the score down.")
+
+        if prod_input >= 70:
+            lines.append("Activity productivity is strong, so the model sees stable work behavior.")
+        elif prod_input < 40:
+            lines.append("Activity productivity is low, which usually indicates weaker work signals.")
+
+        if workload >= 70:
+            lines.append("Workload performance is healthy and helps the employee score.")
+        elif workload < 40:
+            lines.append("Workload performance is weak because of limited completion or high pending work.")
+
+        if len(lines) == 1:
+            lines.append(f"No additional explanation signals were strong for {employee_id} in this period.")
+
+        return lines
+
     def _build_feature_row(self, emp: dict, tasks: list[dict], activity_logs: list[dict]) -> tuple[dict, dict]:
+        # Assemble model-ready inputs and the reporting metadata from employee, task, and activity data.
         now = datetime.now(timezone.utc)
         employee_id = str(emp.get("employee_id") or "UNKNOWN")
         full_name = str(emp.get("full_name") or employee_id)
@@ -413,6 +1025,7 @@ class EfficiencyPredictionService:
 
         return ordered, stats
 
+    # Helper methods for data parsing, normalization, caching, and feature extraction.
     @staticmethod
     def _to_float(value, default: float = 0.0) -> float:
         try:
@@ -422,6 +1035,7 @@ class EfficiencyPredictionService:
         except Exception:
             return default
 
+    # For categorical features, use the most common value or a default if no data is available.
     @staticmethod
     def _mode_or_default(values: list[str], default: str) -> str:
         if not values:
@@ -435,6 +1049,7 @@ class EfficiencyPredictionService:
     def _normalize_employee_id(value: str) -> str:
         return str(value or "").strip().lower()
 
+    # Cache keys are based on the database name and formatted period start,end datetimes 
     @staticmethod
     def _period_cache_key(value: Optional[datetime]) -> str:
         if value is None:
@@ -507,6 +1122,64 @@ class EfficiencyPredictionService:
         if not values:
             return None
         return sum(values) / len(values)
+
+    @staticmethod
+    def _format_lime_factor(feature_term: str, weight: float, predicted_label: str) -> str:
+        term = str(feature_term)
+        base_term = term.split(" <= ")[0].split(" > ")[0].split(" = ")[0].strip()
+        plain_name = EfficiencyPredictionService._plain_feature_name(base_term)
+        if plain_name.lower().startswith("employee id") or plain_name.lower().startswith("employee name"):
+            return ""
+
+        direction = "helped improve" if weight >= 0 else "pulled down"
+        return f"{plain_name} {direction} the employee's score."
+
+    @staticmethod
+    def _plain_feature_name(feature_name: str) -> str:
+        cleaned = str(feature_name).replace("cat__", "").replace("num__", "")
+        cleaned = cleaned.replace("_", " ").strip()
+
+        replacements = [
+            ("workload score", "Workload"),
+            ("productivity score", "Activity productivity"),
+            ("total tasks pending", "Pending tasks"),
+            ("total tasks completed on time", "On-time completions"),
+            ("total tasks completed late", "Late completions"),
+            ("total tasks assigned", "Assigned tasks"),
+            ("completion ratio", "Completion rate"),
+            ("on time ratio", "On-time completion rate"),
+            ("backlog ratio", "Backlog"),
+            ("average time deviation", "Schedule timing"),
+            ("similar tasks completed count", "Similar completed tasks"),
+            ("allocated hours", "Allocated time"),
+            ("actual hours", "Actual time"),
+            ("task priority", "Task priority"),
+            ("task category", "Task category"),
+            ("task status", "Task status"),
+            ("department", "Department"),
+            ("role", "Role"),
+        ]
+
+        lowered = cleaned.lower()
+        for needle, label in replacements:
+            if needle in lowered:
+                return label
+
+        return cleaned.title() if cleaned else "A model feature"
+
+    @staticmethod
+    def _label_score(label: str) -> float:
+        return {
+            "high": 100.0,
+            "medium": 65.0,
+            "low": 30.0,
+        }.get(str(label).strip().lower(), 0.0)
+
+    @classmethod
+    def _calculate_efficiency_score(cls, workload_score: float, predicted_label: str, confidence: float) -> float:
+        label_score = cls._label_score(predicted_label)
+        score = 0.70 * float(workload_score) + 0.30 * (label_score * float(confidence))
+        return float(round(max(0.0, min(100.0, score)), 3))
 
     def _filter_tasks_for_period(
         self,
