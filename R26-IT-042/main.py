@@ -127,7 +127,6 @@ class Application:
         self._wifi_ssid_match = False
         self._current_city = "Unknown"
         self._location_context: dict = {}
-        self._health_monitor_running = False
 
     # ------------------------------------------------------------------
     # Startup
@@ -427,8 +426,6 @@ class Application:
         self._start_thread("C1-UserInteraction", self._start_c1)
         # C4: Productivity prediction
         self._start_thread("C4-ProductivityPrediction", self._start_c4)
-        # Agent heartbeat / readiness
-        self._start_thread("AgentHeartbeat", self._start_health_monitor)
         # REMOTE COMMANDS: Admin-to-Employee instructions
         self._start_thread("COMMANDS", self._start_command_poller)
 
@@ -504,96 +501,6 @@ class Application:
         except Exception as exc:
             log.error("C4 crashed: %s", exc)
 
-    def _update_runtime_status(self, *, agent_status: str, agent_message: str = "", camera_ready: Optional[bool] = None, screen_ready: Optional[bool] = None) -> None:
-        """Persist the employee agent runtime status into the active session document."""
-        try:
-            if not self._session_id or not self._db_client or not self._db_client.is_connected:
-                return
-            col = self._db_client.get_collection("sessions")
-            if col is None:
-                return
-
-            from datetime import datetime, timezone
-
-            update = {
-                "agent_status": agent_status,
-                "agent_message": agent_message,
-                "agent_last_heartbeat": datetime.now(timezone.utc).isoformat(),
-            }
-            if camera_ready is not None:
-                update["camera_ready"] = camera_ready
-            if screen_ready is not None:
-                update["screen_ready"] = screen_ready
-
-            col.update_one({"session_id": self._session_id}, {"$set": update})
-        except Exception as exc:
-            log.debug("Runtime status update failed: %s", exc)
-
-    def _probe_camera_ready(self) -> tuple[bool, str]:
-        """Check whether the local camera can be opened."""
-        try:
-            import cv2
-
-            cap = cv2.VideoCapture(0)
-            try:
-                if not cap.isOpened():
-                    return False, "Camera unavailable or in use"
-                ret, _ = cap.read()
-                if not ret:
-                    return False, "Camera opened but no frame could be read"
-                return True, ""
-            finally:
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-        except Exception as exc:
-            return False, f"Camera preflight failed: {exc}"
-
-    def _probe_screen_ready(self) -> tuple[bool, str]:
-        """Check whether the desktop can be captured from the current session."""
-        try:
-            import pyautogui
-
-            shot = pyautogui.screenshot()
-            if shot is None:
-                return False, "Screen capture returned no image"
-            return True, ""
-        except Exception as exc:
-            return False, f"Screen capture unavailable: {exc}"
-
-    def _start_health_monitor(self) -> None:
-        """Send lightweight heartbeat and capability readiness updates."""
-        if self._health_monitor_running:
-            return
-        self._health_monitor_running = True
-        try:
-            self._update_runtime_status(agent_status="starting", agent_message="Employee agent starting")
-            while not self._shutdown_event.is_set():
-                if self._alert_sender and self._user_id:
-                    try:
-                        self._alert_sender.send_heartbeat(self._user_id)
-                    except Exception as exc:
-                        log.debug("Heartbeat send failed: %s", exc)
-
-                status = "ready"
-                message = "Employee agent healthy"
-                if self._cam_streaming or self._screen_streaming:
-                    status = "streaming"
-                    message = "Remote stream active"
-
-                self._update_runtime_status(
-                    agent_status=status,
-                    agent_message=message,
-                )
-
-                for _ in range(30):
-                    if self._shutdown_event.is_set():
-                        break
-                    time.sleep(1)
-        finally:
-            self._health_monitor_running = False
-
     def _start_command_poller(self) -> None:
         """
         Background thread that listens for instructions from the admin panel
@@ -618,11 +525,6 @@ class Application:
             def handle_screenshot(cmd: dict):
                 log.info("Executing remote command: force_screenshot")
                 try:
-                    screen_ready, screen_msg = self._probe_screen_ready()
-                    if not screen_ready:
-                        self._update_runtime_status(agent_status="degraded", agent_message=screen_msg, screen_ready=False)
-                        raise RuntimeError(screen_msg)
-
                     enc = AESEncryptor()
                     st = ScreenshotTrigger(db_client=self._db_client, encryptor=enc)
                     st.capture(
@@ -631,7 +533,6 @@ class Application:
                         risk_score=cmd.get("risk_score", 0.0),
                         trigger_reason="admin_remote_force"
                     )
-                    self._update_runtime_status(agent_status="ready", agent_message="Force screenshot completed", screen_ready=True)
                 except Exception as e:
                     log.error("Remote screenshot execution failed: %s", e)
                     raise
@@ -643,49 +544,28 @@ class Application:
             def handle_start_cam(cmd: dict):
                 if self._cam_streaming: return
                 log.info("Starting live camera stream for admin")
-                camera_ready, camera_msg = self._probe_camera_ready()
-                if not camera_ready:
-                    self._update_runtime_status(agent_status="degraded", agent_message=camera_msg, camera_ready=False)
-                    raise RuntimeError(camera_msg)
-
                 self._cam_streaming = True
                 
                 def stream_loop():
                     col = self._db_client.get_collection("camera_streams")
-                    # Open camera now that preflight has already verified availability.
                     cap = cv2.VideoCapture(0)
                     if not cap.isOpened():
                         log.error("LIVE CAM: Could not open camera.")
                         if col is not None:
                             col.update_one({"user_id": self._user_id}, {"$set": {"status": "off", "error": "Camera unavailable"}}, upsert=True)
-                        self._update_runtime_status(agent_status="degraded", agent_message="Camera unavailable", camera_ready=False)
                         self._cam_streaming = False
                         return
 
                     log.info("LIVE CAM: Camera stream started.")
-                    consecutive_frame_failures = 0
                     try:
                         while self._cam_streaming and not self._shutdown_event.is_set():
-                            try:
-                                ret, frame = cap.read()
-                                if not ret or frame is None:
-                                    log.warning("LIVE CAM: Failed to capture frame.")
-                                    consecutive_frame_failures += 1
-                                    if consecutive_frame_failures >= 10:
-                                        if col is not None:
-                                            col.update_one({"user_id": self._user_id}, {"$set": {"status": "off", "error": "Repeated camera frame failures"}}, upsert=True)
-                                        self._update_runtime_status(agent_status="degraded", agent_message="Repeated camera frame failures", camera_ready=False)
-                                        self._cam_streaming = False
-                                        break
-                                    time.sleep(0.5)
-                                    continue
-                                consecutive_frame_failures = 0
-
+                            ret, frame = cap.read()
+                            if ret:
                                 # Resize and encode
                                 frame = cv2.resize(frame, (320, 240))
                                 _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
                                 b64 = base64.b64encode(buffer).decode('utf-8')
-
+                                
                                 if col is not None:
                                     col.update_one(
                                         {"user_id": self._user_id},
@@ -696,11 +576,8 @@ class Application:
                                         }},
                                         upsert=True
                                     )
-                            except Exception as e:
-                                log.error("LIVE CAM: Frame loop error: %s", e)
-                                self._update_runtime_status(agent_status="degraded", agent_message=str(e), camera_ready=False)
-                                time.sleep(1.0)
-                                continue
+                            else:
+                                log.warning("LIVE CAM: Failed to capture frame.")
                             time.sleep(1.0)
                     except Exception as e:
                         log.error("LIVE CAM: Loop error: %s", e)
@@ -708,7 +585,6 @@ class Application:
                         cap.release()
                         if col is not None:
                             col.update_one({"user_id": self._user_id}, {"$set": {"status": "off"}})
-                        self._update_runtime_status(agent_status="ready", agent_message="Live camera stopped", camera_ready=True)
                         self._cam_streaming = False
                         log.info("LIVE CAM: Camera stream stopped.")
 
@@ -721,75 +597,37 @@ class Application:
             def handle_start_screen(cmd: dict):
                 if self._screen_streaming: return
                 log.info("Starting live screen stream for admin")
-                screen_ready, screen_msg = self._probe_screen_ready()
-                if not screen_ready:
-                    self._update_runtime_status(agent_status="degraded", agent_message=screen_msg, screen_ready=False)
-                    raise RuntimeError(screen_msg)
-
                 self._screen_streaming = True
                 
                 def screen_loop():
                     import pyautogui, io
                     col = self._db_client.get_collection("screen_streams")
-                    screen_capture_failures = 0
                     try:
                         while self._screen_streaming and not self._shutdown_event.is_set():
-                            # Capture with a small retry in case of transient capture errors
-                            img = None
-                            for attempt in range(3):
-                                try:
-                                    img = pyautogui.screenshot()
-                                    if img is not None:
-                                        break
-                                except Exception as e:
-                                    log.warning("LIVE SCREEN: screenshot attempt %d failed: %s", attempt + 1, e)
-                                    time.sleep(0.3)
-
-                            if img is None:
-                                log.error("LIVE SCREEN: Could not capture screenshot after retries.")
-                                screen_capture_failures += 1
-                                if screen_capture_failures >= 5:
-                                    if col is not None:
-                                        col.update_one({"user_id": self._user_id}, {"$set": {"status": "off", "error": "Repeated screen capture failures"}}, upsert=True)
-                                    self._update_runtime_status(agent_status="degraded", agent_message="Repeated screen capture failures", screen_ready=False)
-                                    self._screen_streaming = False
-                                    break
-                                self._update_runtime_status(agent_status="degraded", agent_message="Screen capture unavailable", screen_ready=False)
-                                time.sleep(1.0)
-                                continue
-
-                            screen_capture_failures = 0
-
+                            # Capture
+                            img = pyautogui.screenshot()
                             # Resize to reasonable size
-                            try:
-                                img = img.resize((640, 360))
-                                buf = io.BytesIO()
-                                img.save(buf, format="JPEG", quality=40)
-                                b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-                                
-                                if col is not None:
-                                    col.update_one(
-                                        {"user_id": self._user_id},
-                                        {"$set": {
-                                            "image_base64": b64,
-                                            "timestamp": datetime.utcnow().isoformat(),
-                                            "status": "streaming"
-                                        }},
-                                        upsert=True
-                                    )
-                            except Exception as e:
-                                log.error("LIVE SCREEN: encode/update error: %s", e)
-                                self._update_runtime_status(agent_status="degraded", agent_message=str(e), screen_ready=False)
+                            img = img.resize((640, 360))
+                            buf = io.BytesIO()
+                            img.save(buf, format="JPEG", quality=40)
+                            b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+                            
+                            if col is not None:
+                                col.update_one(
+                                    {"user_id": self._user_id},
+                                    {"$set": {
+                                        "image_base64": b64,
+                                        "timestamp": datetime.utcnow().isoformat(),
+                                        "status": "streaming"
+                                    }},
+                                    upsert=True
+                                )
                             time.sleep(2.0) # Slightly slower for screen
                     except Exception as e:
                         log.error("LIVE SCREEN: Loop error: %s", e)
                     finally:
                         if col is not None:
-                            try:
-                                col.update_one({"user_id": self._user_id}, {"$set": {"status": "off"}})
-                            except Exception:
-                                pass
-                        self._update_runtime_status(agent_status="ready", agent_message="Live screen stopped", screen_ready=True)
+                            col.update_one({"user_id": self._user_id}, {"$set": {"status": "off"}})
                         self._screen_streaming = False
                         log.info("LIVE SCREEN: Screen stream stopped.")
 
@@ -1127,7 +965,7 @@ class Application:
                 if col is not None:
                     col.update_one(
                         {"session_id": self._session_id},
-                        {"$set": {"status": "ended", "agent_status": "offline", "agent_message": "Employee agent stopped", "logout_at": datetime.utcnow().isoformat()}},
+                        {"$set": {"status": "ended", "logout_at": datetime.utcnow().isoformat()}},
                     )
         except Exception:
             pass
