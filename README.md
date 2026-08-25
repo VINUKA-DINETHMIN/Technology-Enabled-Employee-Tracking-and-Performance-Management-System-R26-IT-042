@@ -478,7 +478,3 @@ If SFace ONNX is missing, follow the URL / instructions in `face_verifier.py` mo
 ## License & ethics
 
 This system handles **biometric-adjacent data**, **keystroke dynamics**, and **screen capture**. Deploy only with **explicit policy**, **employee consent**, **least-privilege access**, **retention limits**, and jurisdiction-compliant privacy review. The codebase includes ethical framing in module docstrings; organisational policy must back it.
-
----
-
-*Generated to reflect the R26-IT-042 / WorkPlus codebase structure. Update this file when adding packages (`C1_user_interaction`), filling C4’s live logger, or changing model filenames.*
