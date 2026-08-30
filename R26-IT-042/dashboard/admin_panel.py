@@ -870,14 +870,13 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
         """
         start = time.time()
 
-        def _check():
+        def _bg_check():
             try:
                 if not self._db or not self._db.is_connected:
-                    # Try again a few times; DB may be transiently unavailable
                     if time.time() - start < timeout_sec:
                         self.after(1000, _check)
                     else:
-                        messagebox.showwarning("Command Status", "Could not confirm command acceptance (DB offline).")
+                        self.after(0, lambda: messagebox.showwarning("Command Status", "Could not confirm command acceptance (DB offline)."))
                     return
 
                 col = self._db.get_collection("commands")
@@ -885,7 +884,7 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
                     if time.time() - start < timeout_sec:
                         self.after(1000, _check)
                     else:
-                        messagebox.showwarning("Command Status", "Commands collection unavailable.")
+                        self.after(0, lambda: messagebox.showwarning("Command Status", "Commands collection unavailable."))
                     return
 
                 doc = col.find_one({"command_id": command_id})
@@ -893,7 +892,7 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
                     if time.time() - start < timeout_sec:
                         self.after(1000, _check)
                     else:
-                        messagebox.showwarning("Command Status", "Command not found in database.")
+                        self.after(0, lambda: messagebox.showwarning("Command Status", "Command not found in database."))
                     return
 
                 status = doc.get("status", "pending")
@@ -901,24 +900,30 @@ class EmployeeDetailWindow(ctk.CTkToplevel):
                     if time.time() - start < timeout_sec:
                         self.after(1000, _check)
                     else:
-                        messagebox.showinfo("Command Status", "Command still pending (no response from employee).")
+                        self.after(0, lambda: messagebox.showinfo("Command Status", "Command still pending (no response from employee)."))
                     return
 
-                # Show final status
                 if status == "processing":
-                    messagebox.showinfo("Command Accepted", "Employee has accepted the command and is processing it.")
+                    self.after(0, lambda: messagebox.showinfo("Command Accepted", "Employee has accepted the command and is processing it."))
                 elif status == "completed":
-                    messagebox.showinfo("Command Completed", "Employee has completed the command.")
+                    self.after(0, lambda: messagebox.showinfo("Command Completed", "Employee has completed the command."))
                 elif status == "failed":
-                    messagebox.showerror("Command Failed", f"Employee reported failure: {doc.get('error')}")
+                    err_txt = str(doc.get('error', 'Unknown error'))
+                    self.after(0, lambda e=err_txt: messagebox.showerror("Command Failed", f"Employee reported failure: {e}"))
                 else:
-                    messagebox.showinfo("Command Status", f"Command status: {status}")
+                    self.after(0, lambda s=status: messagebox.showinfo("Command Status", f"Command status: {s}"))
             except Exception as exc:
                 logger.debug("_wait_for_command_ack check error: %s", exc)
                 if time.time() - start < timeout_sec:
                     self.after(1000, _check)
                 else:
-                    messagebox.showwarning("Command Status", "Unable to determine command status.")
+                    self.after(0, lambda: messagebox.showwarning("Command Status", "Unable to determine command status."))
+
+        def _check():
+            if hasattr(self, "_alerts_executor") and self._alerts_executor:
+                self._alerts_executor.submit(_bg_check)
+            else:
+                threading.Thread(target=_bg_check, daemon=True).start()
 
         # Kick off the first check
         self.after(1000, _check)
@@ -1462,37 +1467,46 @@ class LiveCamViewer(ctk.CTkToplevel):
         if not self._db or not self._db.is_connected: 
             self.after(1000, self._update_loop)
             return
-        
-        try:
-            import base64, io
-            from PIL import Image
-            
-            col = self._db.get_collection("camera_streams")
-            if col is not None:
-                doc = col.find_one({"user_id": self.user_id})
-                if doc:
-                    status = doc.get("status")
-                    if status == "streaming":
-                        b64 = doc.get("image_base64")
-                        if b64:
-                            img_bytes = base64.b64decode(b64)
-                            img = Image.open(io.BytesIO(img_bytes))
-                            # Display
-                            photo = ctk.CTkImage(light_image=img, dark_image=img, size=(640, 480))
-                            self._lbl.configure(image=photo, text="")
-                            self._lbl._image = photo # Keep reference
-                            self._status_lbl.configure(text=f"Live • Last Update: {doc.get('timestamp','?')[-8:]}", text_color=C_GREEN)
-                    elif status == "off":
-                        err = doc.get("error", "Stream stopped by employee system.")
-                        self._status_lbl.configure(text=err, text_color=C_RED)
-                else:
-                    self._status_lbl.configure(text="Waiting for remote device to respond...", text_color=C_AMBER)
-        except Exception as e:
-            if self.winfo_exists():
-                self._status_lbl.configure(text=f"Update failed: {e}", text_color=C_RED)
-        
-        if self.winfo_exists():
-            self.after(1000, self._update_loop)
+
+        def _bg_fetch():
+            try:
+                import base64, io
+                from PIL import Image
+
+                col = self._db.get_collection("camera_streams")
+                if col is not None:
+                    doc = col.find_one({"user_id": self.user_id})
+                    if doc:
+                        status = doc.get("status")
+                        if status == "streaming":
+                            b64 = doc.get("image_base64")
+                            if b64:
+                                img_bytes = base64.b64decode(b64)
+                                img = Image.open(io.BytesIO(img_bytes))
+                                ts = str(doc.get('timestamp','?'))[-8:]
+
+                                def _apply():
+                                    if not self._closed and self.winfo_exists():
+                                        photo = ctk.CTkImage(light_image=img, dark_image=img, size=(640, 480))
+                                        self._lbl.configure(image=photo, text="")
+                                        self._lbl._image = photo
+                                        self._status_lbl.configure(text=f"Live • Last Update: {ts}", text_color=C_GREEN)
+                                self.after(0, _apply)
+                        elif status == "off":
+                            err = doc.get("error", "Stream stopped by employee system.")
+                            if not self._closed and self.winfo_exists():
+                                self.after(0, lambda e=err: self._status_lbl.configure(text=e, text_color=C_RED))
+                    else:
+                        if not self._closed and self.winfo_exists():
+                            self.after(0, lambda: self._status_lbl.configure(text="Waiting for remote device to respond...", text_color=C_AMBER))
+            except Exception as e:
+                if not self._closed and self.winfo_exists():
+                    self.after(0, lambda err=str(e): self._status_lbl.configure(text=f"Update failed: {err}", text_color=C_RED))
+            finally:
+                if not self._closed and self.winfo_exists():
+                    self.after(1000, self._update_loop)
+
+        threading.Thread(target=_bg_fetch, daemon=True).start()
 
     def _on_close(self):
         self._closed = True
@@ -1548,37 +1562,46 @@ class LiveScreenViewer(ctk.CTkToplevel):
         if not self._db or not self._db.is_connected: 
             self.after(1000, self._update_loop)
             return
-        
-        try:
-            import base64, io
-            from PIL import Image
-            
-            col = self._db.get_collection("screen_streams")
-            if col is not None:
-                doc = col.find_one({"user_id": self.user_id})
-                if doc:
-                    status = doc.get("status")
-                    if status == "streaming":
-                        b64 = doc.get("image_base64")
-                        if b64:
-                            img_bytes = base64.b64decode(b64)
-                            img = Image.open(io.BytesIO(img_bytes))
-                            # Display
-                            photo = ctk.CTkImage(light_image=img, dark_image=img, size=(780, 440))
-                            self._lbl.configure(image=photo, text="")
-                            self._lbl._image = photo # Keep reference
-                            self._status_lbl.configure(text=f"Live Screen • Last Update: {doc.get('timestamp','?')[-8:]}", text_color=C_GREEN)
-                    elif status == "off":
-                        err = doc.get("error", "Stream stopped by employee system.")
-                        self._status_lbl.configure(text=err, text_color=C_RED)
-                else:
-                    self._status_lbl.configure(text="Waiting for remote screen capture...", text_color=C_AMBER)
-        except Exception as e:
-            if self.winfo_exists():
-                self._status_lbl.configure(text=f"Update failed: {e}", text_color=C_RED)
-        
-        if self.winfo_exists():
-            self.after(2000, self._update_loop)
+
+        def _bg_fetch():
+            try:
+                import base64, io
+                from PIL import Image
+                
+                col = self._db.get_collection("screen_streams")
+                if col is not None:
+                    doc = col.find_one({"user_id": self.user_id})
+                    if doc:
+                        status = doc.get("status")
+                        if status == "streaming":
+                            b64 = doc.get("image_base64")
+                            if b64:
+                                img_bytes = base64.b64decode(b64)
+                                img = Image.open(io.BytesIO(img_bytes))
+                                ts = str(doc.get('timestamp','?'))[-8:]
+
+                                def _apply():
+                                    if not self._closed and self.winfo_exists():
+                                        photo = ctk.CTkImage(light_image=img, dark_image=img, size=(780, 440))
+                                        self._lbl.configure(image=photo, text="")
+                                        self._lbl._image = photo
+                                        self._status_lbl.configure(text=f"Live Screen • Last Update: {ts}", text_color=C_GREEN)
+                                self.after(0, _apply)
+                        elif status == "off":
+                            err = doc.get("error", "Stream stopped by employee system.")
+                            if not self._closed and self.winfo_exists():
+                                self.after(0, lambda e=err: self._status_lbl.configure(text=e, text_color=C_RED))
+                    else:
+                        if not self._closed and self.winfo_exists():
+                            self.after(0, lambda: self._status_lbl.configure(text="Waiting for remote screen capture...", text_color=C_AMBER))
+            except Exception as e:
+                if not self._closed and self.winfo_exists():
+                    self.after(0, lambda err=str(e): self._status_lbl.configure(text=f"Update failed: {err}", text_color=C_RED))
+            finally:
+                if not self._closed and self.winfo_exists():
+                    self.after(2000, self._update_loop)
+
+        threading.Thread(target=_bg_fetch, daemon=True).start()
 
     def _on_close(self):
         self._closed = True
