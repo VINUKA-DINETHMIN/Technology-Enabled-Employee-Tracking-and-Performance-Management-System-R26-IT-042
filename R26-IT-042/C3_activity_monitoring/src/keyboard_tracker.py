@@ -106,7 +106,7 @@ class KeyboardTracker:
                     if key_id in self._pending_press:
                         press_ts, is_bs = self._pending_press.pop(key_id)
                         dwell = (release_ts - press_ts) * 1000.0  # ms
-                        if 0 < dwell < 2000:  # sanity filter
+                        if 0 <= dwell < 2000:  # sanity filter
                             self._keystrokes.append({
                                 "press_ts": press_ts,
                                 "release_ts": release_ts,
