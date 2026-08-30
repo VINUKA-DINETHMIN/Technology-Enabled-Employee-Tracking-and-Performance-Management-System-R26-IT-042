@@ -1894,7 +1894,7 @@ class AdminPanel(ctk.CTk):
 
         ctk.CTkLabel(
             self._eff_pie_frame,
-            text="Prediction Distribution",
+            text="Efficiency Prediction Distribution",
             text_color=C_TEXT,
             font=ctk.CTkFont(size=11, weight="bold"),
         ).pack(anchor="w", padx=10, pady=(8, 2))
