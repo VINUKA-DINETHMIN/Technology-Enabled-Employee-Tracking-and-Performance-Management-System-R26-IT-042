@@ -422,6 +422,11 @@ class EfficiencyWindow(ctk.CTk):
             period_start=period_start,
             period_end=period_end,
         )
+        weekly_forecast = self._service.get_employee_weekly_forecast(
+            self._db,
+            employee_id=employee_id,
+            period_end=period_end,
+        )
 
         efficiency_state = "strong" if report.efficiency_score >= 70 else "needs attention" if report.efficiency_score < 50 else "mixed"
         workload_state = "healthy" if report.workload_score >= 70 else "strained" if report.workload_score < 50 else "moderate"
@@ -443,38 +448,16 @@ class EfficiencyWindow(ctk.CTk):
             ),
             text_color=C_MUTED,
             font=ctk.CTkFont(size=12),
-            wraplength=780,
+            wraplength=760,
             justify="left",
         ).pack(anchor="w", padx=12, pady=(0, 4))
 
-        ctk.CTkLabel(
-            content,
-            text="How to read the model output",
-            text_color=C_TEXT,
-            font=ctk.CTkFont(size=13, weight="bold"),
-        ).pack(anchor="w", padx=12, pady=(10, 4))
+        # Get weekly forecast with real-time ML predictions
+        realtime_score = self._service.get_employee_realtime_forecast(self._db, employee_id=employee_id)
+        if realtime_score is not None:
+            weekly_forecast._realtime_score = realtime_score
 
-        ctk.CTkLabel(
-            content,
-            text=(
-                "The lines below are the main reasons the model leaned toward this result. They describe whether task completion, pending work, "
-                "and activity patterns helped the employee's score or pulled it down."
-            ),
-            text_color=C_MUTED,
-            font=ctk.CTkFont(size=12),
-            wraplength=780,
-            justify="left",
-        ).pack(anchor="w", padx=12, pady=(0, 4))
-
-        for line in lime_lines:
-            ctk.CTkLabel(
-                content,
-                text=f"- {line}",
-                text_color=C_MUTED,
-                font=ctk.CTkFont(size=12),
-                justify="left",
-                wraplength=780,
-            ).pack(anchor="w", padx=12, pady=2)
+        self._render_weekly_forecast_section(content, weekly_forecast)
 
         ctk.CTkButton(
             win,
@@ -484,6 +467,173 @@ class EfficiencyWindow(ctk.CTk):
             width=110,
             command=win.destroy,
         ).pack(anchor="e", padx=16, pady=(0, 14))
+
+    def _render_weekly_forecast_section(self, parent, forecast) -> None:
+        section = ctk.CTkFrame(parent, fg_color="#10172b", corner_radius=10, border_width=1, border_color=C_BORDER)
+        section.pack(fill="x", padx=12, pady=(10, 4))
+
+        ctk.CTkLabel(
+            section,
+            text="Weekly Efficiency Forecast",
+            text_color=C_TEXT,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(10, 2))
+
+        # Check for real-time ML forecast availability
+        has_realtime = hasattr(forecast, '_realtime_score') and forecast._realtime_score is not None
+        has_history = getattr(forecast, "available", False) and forecast.history_scores
+
+        # Build message - different for history vs realtime only
+        message_text = forecast.message
+        if not has_history and has_realtime:
+            message_text = "Real-time ML forecast (insufficient historical data for trend analysis)"
+
+        ctk.CTkLabel(
+            section,
+            text=message_text,
+            text_color=C_MUTED,
+            font=ctk.CTkFont(size=11),
+            wraplength=780,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        body = ctk.CTkFrame(section, fg_color=C_CARD, corner_radius=8)
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        # Show message if neither history nor realtime available
+        if not has_history and not has_realtime:
+            ctk.CTkLabel(
+                body,
+                text=forecast.message,
+                text_color=C_MUTED,
+                font=ctk.CTkFont(size=12),
+                wraplength=740,
+                justify="left",
+            ).pack(anchor="w", padx=12, pady=18)
+            return
+
+        try:
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.figure import Figure
+            from matplotlib.ticker import FuncFormatter
+        except Exception as exc:
+            ctk.CTkLabel(
+                body,
+                text=f"Forecast chart unavailable: {exc}",
+                text_color=C_MUTED,
+                font=ctk.CTkFont(size=12),
+                wraplength=740,
+                justify="left",
+            ).pack(anchor="w", padx=12, pady=18)
+            return
+
+        fig = Figure(figsize=(6.2, 2.9), dpi=100, facecolor="#10172b")
+        ax = fig.add_subplot(111)
+        ax.set_facecolor("#10172b")
+
+        today = datetime.now(timezone.utc).date()
+        upcoming_dates = [today + timedelta(days=i) for i in range(7)]
+
+        # Handle two cases: (1) historical data available, or (2) only realtime forecast
+        if has_history:
+            # Plot with full history + both forecasts
+            history_x = list(range(len(forecast.history_scores)))
+            forecast_x = len(history_x)
+            labels = list(forecast.history_weeks)
+            labels.append(f"Next\n{forecast.forecast_week}")
+
+            ax.plot(history_x, forecast.history_scores, color=C_TEAL, linewidth=2.4, marker="o", markersize=5)
+            
+            # Plot linear regression forecast (existing)
+            ax.plot(
+                [history_x[-1], forecast_x],
+                [forecast.history_scores[-1], float(forecast.forecast_score or forecast.history_scores[-1])],
+                color=C_AMBER,
+                linewidth=2.2,
+                linestyle="--",
+                marker="o",
+                markersize=5,
+            )
+            ax.scatter([forecast_x], [float(forecast.forecast_score or forecast.history_scores[-1])], color=C_AMBER, s=55, zorder=5)
+            ax.annotate(
+                f"{float(forecast.forecast_score or forecast.history_scores[-1]):.1f}",
+                (forecast_x, float(forecast.forecast_score or forecast.history_scores[-1])),
+                textcoords="offset points",
+                xytext=(0, 8),
+                ha="center",
+                color=C_AMBER,
+                fontsize=9,
+                fontweight="bold",
+            )
+            
+            # Add real-time ML forecast if available
+            if has_realtime:
+                rt_score = float(forecast._realtime_score)
+                ax.plot(
+                    [history_x[-1], forecast_x],
+                    [forecast.history_scores[-1], rt_score],
+                    color="#10b981",
+                    linewidth=2.2,
+                    linestyle=":",
+                    marker="s",
+                    markersize=5,
+                    alpha=0.8,
+                )
+                ax.scatter([forecast_x], [rt_score], color="#10b981", s=55, zorder=5, alpha=0.8)
+                ax.annotate(
+                    f"{rt_score:.1f}",
+                    (forecast_x, rt_score),
+                    textcoords="offset points",
+                    xytext=(0, -12),
+                    ha="center",
+                    color="#10b981",
+                    fontsize=9,
+                    fontweight="bold",
+                )
+
+            ax.set_ylim(0, 100)
+            ax.set_xlim(-0.2, forecast_x + 0.4)
+            ax.set_xticks(list(range(len(labels))))
+            ax.set_xticklabels(labels, color=C_TEXT, fontsize=8)
+            ax.axvline(history_x[-1], color="#23324d", linestyle=":", linewidth=1)
+        else:
+            # Plot realtime-only forecast across the next 7 calendar days
+            rt_score = float(forecast._realtime_score)
+            x_pos = list(range(7))
+            y_values = [50.0] + [rt_score] * 6
+            day_labels = [d.strftime("%b %d") for d in upcoming_dates]
+            
+            ax.plot(x_pos, y_values, color="#10b981", linewidth=2.8, linestyle=":", marker="o", markersize=7, alpha=0.9)
+            ax.scatter([x_pos[-1]], [rt_score], color="#10b981", s=100, zorder=5, alpha=0.9)
+            ax.annotate(
+                f"{rt_score:.1f}",
+                (x_pos[-1], rt_score),
+                textcoords="offset points",
+                xytext=(0, 10),
+                ha="center",
+                color="#10b981",
+                fontsize=11,
+                fontweight="bold",
+            )
+            
+            ax.set_ylim(0, 100)
+            ax.set_xlim(-0.3, 6.3)
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(day_labels, color=C_TEXT, fontsize=8)
+
+        ax.tick_params(axis="y", colors=C_TEXT, labelsize=8)
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.0f}%"))
+        ax.set_ylabel("Efficiency score", color=C_TEXT, fontsize=9)
+        ax.set_xlabel("Date", color=C_TEXT, fontsize=9)
+        ax.grid(axis="y", color="#23324d", linestyle="-", linewidth=0.6)
+        for sp in ax.spines.values():
+            sp.set_color("#23324d")
+
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=body)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        body._forecast_canvas = canvas
 
 
 def launch_efficiency_window(db: MongoDBClient | None = None) -> None:
