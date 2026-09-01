@@ -621,6 +621,9 @@ class EfficiencyPredictionService:
             stability = 0.5
             trend = "stable"
 
+        current_score = self._get_employee_current_efficiency_score(db_client, employee_id)
+        if current_score is not None:
+            forecast_raw = float(self._dampen_forecast_jump(current_score, forecast_raw))
         forecast_score = float(max(0.0, min(100.0, round(forecast_raw, 1))))
         next_week_start = weekly_points[-1][0] + timedelta(days=7)
         forecast_week = next_week_start.strftime("%b %d")
@@ -642,6 +645,41 @@ class EfficiencyPredictionService:
             forecast_score=forecast_score,
             source_weeks=len(week_scores),
         )
+
+    def _get_employee_current_efficiency_score(self, db_client, employee_id: str) -> Optional[float]:
+        """Return the current employee efficiency score from the classification model.
+
+        This is used as an anchor so the forecast does not jump wildly compared to the
+        latest observed productivity state.
+        """
+        try:
+            if db_client is None or not getattr(db_client, "is_connected", False):
+                return None
+
+            results = self.predict_all(db_client)
+            target_id = self._normalize_employee_id(employee_id)
+            for result in results:
+                if self._normalize_employee_id(result.employee_id) == target_id:
+                    return float(np.clip(result.efficiency_score, 0.0, 100.0))
+            return None
+        except Exception as exc:
+            logger.debug(f"Could not obtain current efficiency score for {employee_id}: {exc}")
+            return None
+
+    def _dampen_forecast_jump(self, current_score: Optional[float], raw_prediction: float) -> float:
+        """Blend the raw ML forecast with the current score to avoid dramatic jumps."""
+        if current_score is None:
+            return float(np.clip(raw_prediction, 0.0, 100.0))
+
+        gap = abs(float(raw_prediction) - float(current_score))
+        if gap <= 10:
+            blended = 0.5 * float(current_score) + 0.5 * float(raw_prediction)
+        elif gap <= 25:
+            blended = 0.65 * float(current_score) + 0.35 * float(raw_prediction)
+        else:
+            blended = 0.75 * float(current_score) + 0.25 * float(raw_prediction)
+
+        return float(np.clip(blended, 0.0, 100.0))
 
     def get_employee_realtime_forecast(self, db_client, employee_id: str) -> Optional[float]:
         """Generate real-time next-day productivity forecast using trained ML model.
@@ -705,8 +743,12 @@ class EfficiencyPredictionService:
             
             # Use the trained model to predict
             prediction = self._forecast_model.predict(feature_data)
-            forecast_score = float(np.clip(prediction[0], 0, 100))
-            logger.info(f"Real-time forecast for {employee_id}: {forecast_score:.2f}")
+            raw_prediction = float(np.clip(prediction[0], 0, 100))
+            current_score = self._get_employee_current_efficiency_score(db_client, employee_id)
+            forecast_score = self._dampen_forecast_jump(current_score, raw_prediction)
+            logger.info(
+                f"Real-time forecast for {employee_id}: raw={raw_prediction:.2f}, current={current_score}, adjusted={forecast_score:.2f}"
+            )
             return forecast_score
             
         except Exception as exc:
