@@ -456,6 +456,7 @@ class EfficiencyWindow(ctk.CTk):
         realtime_score = self._service.get_employee_realtime_forecast(self._db, employee_id=employee_id)
         if realtime_score is not None:
             weekly_forecast._realtime_score = realtime_score
+        weekly_forecast.current_score = float(report.efficiency_score)
 
         self._render_weekly_forecast_section(content, weekly_forecast)
 
@@ -597,10 +598,14 @@ class EfficiencyWindow(ctk.CTk):
             ax.set_xticklabels(labels, color=C_TEXT, fontsize=8)
             ax.axvline(history_x[-1], color="#23324d", linestyle=":", linewidth=1)
         else:
-            # Plot realtime-only forecast across the next 7 calendar days
+            # Plot realtime-only forecast across the next 7 calendar days.
+            # Use the employee's actual current score as the starting point so the chart
+            # reflects the current state instead of a misleading neutral 50 baseline.
             rt_score = float(forecast._realtime_score)
+            current_score = getattr(forecast, "current_score", None)
+            start_score = float(current_score) if current_score is not None else rt_score
             x_pos = list(range(7))
-            y_values = [50.0] + [rt_score] * 6
+            y_values = [start_score] + [rt_score] * 6
             day_labels = [d.strftime("%b %d") for d in upcoming_dates]
             
             ax.plot(x_pos, y_values, color="#10b981", linewidth=2.8, linestyle=":", marker="o", markersize=7, alpha=0.9)

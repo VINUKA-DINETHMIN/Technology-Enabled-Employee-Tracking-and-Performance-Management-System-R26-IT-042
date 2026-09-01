@@ -65,6 +65,7 @@ class EmployeeWeeklyForecast:
     history_scores: list[float] = field(default_factory=list)
     forecast_week: str = ""
     forecast_score: Optional[float] = None
+    current_score: Optional[float] = None
     source_weeks: int = 0
 
 
