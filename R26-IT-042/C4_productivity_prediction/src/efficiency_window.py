@@ -444,7 +444,6 @@ class EfficiencyWindow(ctk.CTk):
             text=(
                 f"This employee's efficiency score is {report.efficiency_score:.1f}/100, so the current picture is {efficiency_state}. "
                 f"The workload score is {report.workload_score:.1f}/100, which is {workload_state}. {insight_summary} "
-                "Taken together, this helps a manager or HR reviewer decide whether the employee is performing well, holding steady, or slipping because of unfinished work, late completion, or weaker activity patterns."
             ),
             text_color=C_MUTED,
             font=ctk.CTkFont(size=12),
